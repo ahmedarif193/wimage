@@ -1,0 +1,8 @@
+native-wimage
+*.o
+*.a
+*.cxx
+*.html
+Makefile.cxx
+tests/build/
+build/
