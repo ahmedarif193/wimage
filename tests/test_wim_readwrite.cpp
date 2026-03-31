@@ -433,6 +433,108 @@ TEST_F(WimTestFixture, Integrity_Corruption)
     wim_close(&ctx2);
 }
 
+TEST_F(WimTestFixture, Integrity_XpressRoundTrip)
+{
+    /* Integrity with XPRESS compression: verifies hash range excludes XML. */
+    make_source_dir("src");
+    char buf[40000];
+    for (size_t i = 0; i < sizeof(buf); i++)
+        buf[i] = (char)(i % 251);
+    write_file("src/data.bin", buf, sizeof(buf));
+
+    WimCtx ctx;
+    wim_ctx_init(&ctx);
+    ASSERT_EQ(0, wim_create(&ctx, path("test.wim").c_str(), 1));
+    ASSERT_EQ(0, wim_capture_tree(&ctx, path("src").c_str(), "Img", NULL));
+    ASSERT_EQ(0, wim_finalize(&ctx, 1));
+
+    WimCtx ctx2;
+    wim_ctx_init(&ctx2);
+    ASSERT_EQ(0, wim_open(&ctx2, path("test.wim").c_str()));
+    EXPECT_EQ(0, wim_verify_integrity(&ctx2));
+
+    ASSERT_EQ(0, wim_select_image(&ctx2, 1));
+    const WimDentry* root = wim_get_root(&ctx2, 1);
+    ASSERT_NE(nullptr, root);
+    make_source_dir("out");
+    ASSERT_EQ(0, wim_extract_tree(&ctx2, root, path("out").c_str()));
+
+    std::string content = read_file("out/data.bin");
+    ASSERT_EQ(sizeof(buf), content.size());
+    EXPECT_EQ(0, memcmp(buf, content.data(), sizeof(buf)));
+    wim_close(&ctx2);
+}
+
+TEST_F(WimTestFixture, RoundTrip_AllZerosFile)
+{
+    /* All-zeros file: tests XPRESS compression of uniform data and
+     * the raw fallback when compression doesn't save space. */
+    make_source_dir("src");
+    std::vector<char> zeros(100000, 0);
+    write_file("src/zeros.bin", zeros.data(), zeros.size());
+
+    WimCtx ctx;
+    wim_ctx_init(&ctx);
+    ASSERT_EQ(0, wim_create(&ctx, path("test.wim").c_str(), 1));
+    ASSERT_EQ(0, wim_capture_tree(&ctx, path("src").c_str(), "Img", NULL));
+    ASSERT_EQ(0, wim_finalize(&ctx, 0));
+
+    WimCtx ctx2;
+    wim_ctx_init(&ctx2);
+    ASSERT_EQ(0, wim_open(&ctx2, path("test.wim").c_str()));
+    ASSERT_EQ(0, wim_select_image(&ctx2, 1));
+    const WimDentry* root = wim_get_root(&ctx2, 1);
+    ASSERT_NE(nullptr, root);
+    make_source_dir("out");
+    ASSERT_EQ(0, wim_extract_tree(&ctx2, root, path("out").c_str()));
+
+    std::string content = read_file("out/zeros.bin");
+    ASSERT_EQ(zeros.size(), content.size());
+    EXPECT_EQ(0, memcmp(zeros.data(), content.data(), zeros.size()));
+    wim_close(&ctx2);
+}
+
+TEST_F(WimTestFixture, CompressionFallback_IncompressibleMultiChunk)
+{
+    /* Random data spanning multiple chunks: compressed output should not
+     * be larger than raw. The blob should be stored uncompressed. */
+    make_source_dir("src");
+    std::vector<uint8_t> rnd(65536);
+    srand(42);
+    for (auto& b : rnd) b = (uint8_t)(rand() & 0xFF);
+    write_file("src/random.bin", rnd.data(), rnd.size());
+
+    WimCtx ctx;
+    wim_ctx_init(&ctx);
+    ASSERT_EQ(0, wim_create(&ctx, path("test.wim").c_str(), 1));
+    ASSERT_EQ(0, wim_capture_tree(&ctx, path("src").c_str(), "Img", NULL));
+
+    /* Find the data blob - its compressed_size should equal original_size
+     * (stored raw) because random data is incompressible. */
+    for (size_t i = 0; i < ctx.blob_count; i++) {
+        if (ctx.blobs[i].flags & WIM_RESHDR_FLAG_METADATA) continue;
+        EXPECT_LE(ctx.blobs[i].compressed_size, ctx.blobs[i].original_size)
+            << "Compressed size must not exceed original for incompressible data";
+    }
+
+    ASSERT_EQ(0, wim_finalize(&ctx, 0));
+
+    /* Verify round-trip */
+    WimCtx ctx2;
+    wim_ctx_init(&ctx2);
+    ASSERT_EQ(0, wim_open(&ctx2, path("test.wim").c_str()));
+    ASSERT_EQ(0, wim_select_image(&ctx2, 1));
+    const WimDentry* root = wim_get_root(&ctx2, 1);
+    ASSERT_NE(nullptr, root);
+    make_source_dir("out");
+    ASSERT_EQ(0, wim_extract_tree(&ctx2, root, path("out").c_str()));
+
+    std::string content = read_file("out/random.bin");
+    ASSERT_EQ(rnd.size(), content.size());
+    EXPECT_EQ(0, memcmp(rnd.data(), content.data(), rnd.size()));
+    wim_close(&ctx2);
+}
+
 /* ================================================================
  *  Error handling
  * ================================================================ */

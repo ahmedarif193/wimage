@@ -262,6 +262,44 @@ TEST(Xpress, ChunkMayCompress_Small)
     EXPECT_NE(result, 0);
 }
 
+TEST(Xpress, ChunkMayCompress_AllZeros)
+{
+    /* All-zeros data must be detected as compressible (not incompressible).
+     * Regression: the heuristic hash collision check used > instead of >=,
+     * causing uniform data to be falsely classified as incompressible. */
+    std::vector<uint8_t> data(32768, 0);
+    int result = xpress_huff_chunk_may_compress(data.data(), (uint32_t)data.size());
+    EXPECT_NE(result, 0);
+}
+
+TEST(Xpress, ChunkMayCompress_UniformByte)
+{
+    /* Any single-byte fill should be compressible */
+    std::vector<uint8_t> data(32768, 0xAA);
+    int result = xpress_huff_chunk_may_compress(data.data(), (uint32_t)data.size());
+    EXPECT_NE(result, 0);
+}
+
+TEST(Xpress, RoundTrip_AllZeros_32K)
+{
+    /* All-zeros must compress and round-trip correctly */
+    std::vector<uint8_t> data(32768, 0);
+    roundtrip(data.data(), (uint32_t)data.size());
+}
+
+TEST(Xpress, RoundTrip_SmallBuffer)
+{
+    /* Small buffers near h3 boundary (3 bytes needed for hash).
+     * Regression: HC_INSERT had no bounds check, causing heap-buffer-overflow
+     * when compressing buffers where pos+2 >= in_len. */
+    for (uint32_t sz = 1; sz <= 16; sz++) {
+        std::vector<uint8_t> data(sz);
+        for (uint32_t i = 0; i < sz; i++)
+            data[i] = (uint8_t)(i * 37);
+        roundtrip(data.data(), sz);
+    }
+}
+
 /* ================================================================
  * Larger round-trip tests
  * ================================================================ */
