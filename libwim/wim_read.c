@@ -686,6 +686,15 @@ int wim_extract_file(WimCtx* ctx, const WimDentry* d, const char* dest_path)
     return 0;
 }
 
+static int is_safe_name(const char* name)
+{
+    if (!name || !name[0]) return 0;
+    if (name[0] == '/') return 0;
+    if (strchr(name, '/') || strchr(name, '\\')) return 0;
+    if (strcmp(name, "..") == 0 || strcmp(name, ".") == 0) return 0;
+    return 1;
+}
+
 int wim_extract_tree(WimCtx* ctx, const WimDentry* d, const char* dest_dir)
 {
     if (d->attributes & WIM_FILE_ATTRIBUTE_DIRECTORY) {
@@ -695,6 +704,11 @@ int wim_extract_tree(WimCtx* ctx, const WimDentry* d, const char* dest_dir)
             const WimDentry* child = &d->children[i];
             if (!child->name_utf8)
                 continue;
+            if (!is_safe_name(child->name_utf8)) {
+                fprintf(stderr, "Warning: skipping unsafe path component \"%s\"\n",
+                        child->name_utf8);
+                continue;
+            }
 
             size_t path_len = strlen(dest_dir) + 1 + strlen(child->name_utf8) + 1;
             char* child_path = (char*)malloc(path_len);

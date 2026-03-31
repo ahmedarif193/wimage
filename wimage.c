@@ -494,6 +494,9 @@ static int do_capture(void)
         return ret;
     }
 
+    if (g_boot)
+        ctx.header.boot_index = (uint32_t)ctx.image_count;
+
     ret = wim_finalize(&ctx, g_check);
     if (ret != 0) {
         fprintf(stderr, "Error: finalize failed\n");

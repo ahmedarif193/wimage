@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* Checked fwrite: returns -1 on short write */
 static inline int wim_fwrite(const void* buf, size_t size, FILE* f)
@@ -583,6 +584,34 @@ static int write_lookup_table(WimCtx* ctx)
     return 0;
 }
 
+static char* xml_escape(const char* s)
+{
+    size_t cap = strlen(s) * 2 + 1;
+    char* out = (char*)malloc(cap);
+    if (!out) return NULL;
+    size_t len = 0;
+    for (; *s; s++) {
+        const char* rep = NULL;
+        switch (*s) {
+            case '&': rep = "&amp;"; break;
+            case '<': rep = "&lt;"; break;
+            case '>': rep = "&gt;"; break;
+            case '"': rep = "&quot;"; break;
+        }
+        if (rep) {
+            size_t rlen = strlen(rep);
+            while (len + rlen + 1 > cap) { cap *= 2; out = (char*)realloc(out, cap); if (!out) return NULL; }
+            memcpy(out + len, rep, rlen);
+            len += rlen;
+        } else {
+            if (len + 2 > cap) { cap *= 2; out = (char*)realloc(out, cap); if (!out) return NULL; }
+            out[len++] = *s;
+        }
+    }
+    out[len] = '\0';
+    return out;
+}
+
 static char* generate_xml(WimCtx* ctx)
 {
     size_t cap = 4096;
@@ -598,6 +627,7 @@ static char* generate_xml(WimCtx* ctx)
 
     char numbuf[64];
 
+    XML_APPEND("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n");
     XML_APPEND("<WIM>\n");
 
     /* Total bytes */
@@ -665,14 +695,12 @@ static char* generate_xml(WimCtx* ctx)
         XML_APPEND("</LOWPART></LASTMODIFICATIONTIME>\n");
 
         if (info->name[0] != '\0') {
-            XML_APPEND("<NAME>");
-            XML_APPEND(info->name);
-            XML_APPEND("</NAME>\n");
+            char* esc = xml_escape(info->name);
+            if (esc) { XML_APPEND("<NAME>"); XML_APPEND(esc); XML_APPEND("</NAME>\n"); free(esc); }
         }
         if (info->description[0] != '\0') {
-            XML_APPEND("<DESCRIPTION>");
-            XML_APPEND(info->description);
-            XML_APPEND("</DESCRIPTION>\n");
+            char* esc = xml_escape(info->description);
+            if (esc) { XML_APPEND("<DESCRIPTION>"); XML_APPEND(esc); XML_APPEND("</DESCRIPTION>\n"); free(esc); }
         }
 
         XML_APPEND("</IMAGE>\n");
@@ -826,10 +854,20 @@ int wim_create(WimCtx* ctx, const char* filename, int use_xpress)
     }
     ctx->header.chunk_size = use_xpress ? 32768 : 0;
 
-    /* Generate a pseudo-random GUID */
-    srand((unsigned)time(NULL));
-    for (int i = 0; i < 16; i++)
-        ctx->header.guid[i] = (uint8_t)(rand() & 0xFF);
+    /* Generate GUID from /dev/urandom, fallback to rand() */
+    {
+        FILE* urand = fopen("/dev/urandom", "rb");
+        if (urand) {
+            size_t n = fread(ctx->header.guid, 1, 16, urand);
+            fclose(urand);
+            if (n < 16)
+                memset(ctx->header.guid + n, 0, 16 - n);
+        } else {
+            srand((unsigned)time(NULL) ^ (unsigned)getpid());
+            for (int i = 0; i < 16; i++)
+                ctx->header.guid[i] = (uint8_t)(rand() & 0xFF);
+        }
+    }
 
     ctx->header.part_number = 1;
     ctx->header.total_parts = 1;
