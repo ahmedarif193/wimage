@@ -22,9 +22,19 @@ XpressCompressScratch* xpress_huff_create_scratch(uint32_t max_input_len);
 void xpress_huff_destroy_scratch(XpressCompressScratch* scratch);
 int xpress_huff_chunk_may_compress(const uint8_t* in, uint32_t in_len);
 
+/* Workspace size for static (no-malloc) decompressor: 128KB */
+#define XPRESS_DECOMPRESS_WORKSPACE_SIZE (32768 * 4)
+
 XpressStatus xpress_huff_decompress(
     const uint8_t* in, uint32_t in_len,
     uint8_t* out, uint32_t out_len);
+
+/* Static variant: caller provides workspace (XPRESS_DECOMPRESS_WORKSPACE_SIZE bytes).
+ * No malloc/free -- suitable for bootloaders and freestanding environments. */
+XpressStatus xpress_huff_decompress_static(
+    const uint8_t* in, uint32_t in_len,
+    uint8_t* out, uint32_t out_len,
+    void* workspace);
 
 XpressStatus xpress_huff_compress_with_scratch(
     const uint8_t* in, uint32_t in_len,

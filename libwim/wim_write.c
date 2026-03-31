@@ -15,7 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
 
 /* Checked fwrite: returns -1 on short write */
 static inline int wim_fwrite(const void* buf, size_t size, FILE* f)

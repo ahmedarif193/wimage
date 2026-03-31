@@ -339,6 +339,73 @@ TEST(Xpress, KraftOverflow_ManySymbols)
 }
 
 /* ================================================================
+ * Static (no-malloc) decompressor for bootloader use
+ * ================================================================ */
+
+TEST(Xpress, DecompressStatic_RoundTrip)
+{
+    /* Compress with normal API, decompress with static (no-malloc) API */
+    const char* pattern = "ABCDEFGHIJKLMNOP\n";
+    size_t plen = strlen(pattern);
+    std::vector<uint8_t> data(32768);
+    for (size_t i = 0; i < data.size(); i++)
+        data[i] = (uint8_t)pattern[i % plen];
+
+    std::vector<uint8_t> comp(data.size() + 4096);
+    uint32_t comp_len = 0;
+    XpressStatus st = xpress_huff_compress(data.data(), (uint32_t)data.size(),
+                                           comp.data(), (uint32_t)comp.size(), &comp_len);
+    ASSERT_EQ(st, XPRESS_OK);
+
+    /* Decompress with static workspace */
+    std::vector<uint8_t> workspace(XPRESS_DECOMPRESS_WORKSPACE_SIZE);
+    std::vector<uint8_t> decomp(data.size());
+    st = xpress_huff_decompress_static(comp.data(), comp_len,
+                                       decomp.data(), (uint32_t)decomp.size(),
+                                       workspace.data());
+    ASSERT_EQ(st, XPRESS_OK);
+    EXPECT_EQ(memcmp(data.data(), decomp.data(), data.size()), 0);
+}
+
+TEST(Xpress, DecompressStatic_MatchesDynamic)
+{
+    /* Both decompress variants must produce identical output */
+    std::vector<uint8_t> data(32768);
+    srand(44444);
+    for (auto& b : data) b = (uint8_t)(rand() & 0xFF);
+    /* Make it compressible with some matches */
+    for (size_t i = 128; i < data.size() - 32; i += 61)
+        memcpy(&data[i], &data[i - 64], 8);
+
+    std::vector<uint8_t> comp(data.size() + 4096);
+    uint32_t comp_len = 0;
+    XpressStatus st = xpress_huff_compress(data.data(), (uint32_t)data.size(),
+                                           comp.data(), (uint32_t)comp.size(), &comp_len);
+    if (st != XPRESS_OK) return; /* skip if incompressible */
+
+    std::vector<uint8_t> out_dynamic(data.size());
+    st = xpress_huff_decompress(comp.data(), comp_len,
+                                out_dynamic.data(), (uint32_t)out_dynamic.size());
+    ASSERT_EQ(st, XPRESS_OK);
+
+    std::vector<uint8_t> workspace(XPRESS_DECOMPRESS_WORKSPACE_SIZE);
+    std::vector<uint8_t> out_static(data.size());
+    st = xpress_huff_decompress_static(comp.data(), comp_len,
+                                       out_static.data(), (uint32_t)out_static.size(),
+                                       workspace.data());
+    ASSERT_EQ(st, XPRESS_OK);
+    EXPECT_EQ(memcmp(out_dynamic.data(), out_static.data(), data.size()), 0);
+}
+
+TEST(Xpress, DecompressStatic_NullWorkspace)
+{
+    uint8_t in[256] = {0};
+    uint8_t out[256];
+    XpressStatus st = xpress_huff_decompress_static(in, sizeof(in), out, sizeof(out), nullptr);
+    EXPECT_EQ(st, XPRESS_BAD_DATA);
+}
+
+/* ================================================================
  * Larger round-trip tests
  * ================================================================ */
 

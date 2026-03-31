@@ -15,8 +15,13 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <utime.h>
 #include <unistd.h>
+#else
+#include <direct.h>
+#define mkdir(d, m) _mkdir(d)
+#endif
 
 /* ================================================================
  *  Internal helpers
@@ -676,12 +681,14 @@ int wim_extract_file(WimCtx* ctx, const WimDentry* d, const char* dest_path)
     }
 
     /* Set file times */
+#ifndef _WIN32
     if (d->last_write_time != 0 || d->last_access_time != 0) {
         struct utimbuf times;
         times.actime = filetime_to_unix(d->last_access_time);
         times.modtime = filetime_to_unix(d->last_write_time);
         utime(dest_path, &times);
     }
+#endif
 
     return 0;
 }

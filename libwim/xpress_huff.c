@@ -108,32 +108,23 @@ static int build_dtable(const uint8_t cl[NSYM], DEntry tbl[TBLSZ])
     return 1;
 }
 
-XpressStatus xpress_huff_decompress(
+/* Core decompressor: tbl must point to TBLSZ DEntry elements */
+static XpressStatus decompress_core(
     const uint8_t* in, uint32_t in_len,
-    uint8_t* out, uint32_t out_len)
+    uint8_t* out, uint32_t out_len,
+    DEntry* tbl)
 {
-    if (in_len < HTBL_BYTES) return XPRESS_BAD_DATA;
-
-    /* Unpack code lengths */
     uint8_t cl[NSYM];
     for (int i = 0; i < HTBL_BYTES; i++) {
         cl[2 * i]     = in[i] & 0x0F;
         cl[2 * i + 1] = (in[i] >> 4) & 0x0F;
     }
 
-    DEntry* tbl = (DEntry*)malloc(sizeof(DEntry) * TBLSZ);
-    if (!tbl) return XPRESS_BAD_DATA;
-    if (!build_dtable(cl, tbl)) { free(tbl); return XPRESS_BAD_DATA; }
+    if (!build_dtable(cl, tbl)) return XPRESS_BAD_DATA;
 
     const uint8_t* p   = in + HTBL_BYTES;
     const uint8_t* end = in + in_len;
 
-    /*
-     * MSB-first bit buffer, demand-driven refill matching wimlib semantics:
-     *   - bits left-justified (next bit is always bit 31)
-     *   - refill loads one LE 16-bit word when nbits < needed
-     *   - inline bytes (length extensions) are read from 'p' directly
-     */
     uint32_t bits = 0;
     int nbits = 0;
 
@@ -146,14 +137,12 @@ XpressStatus xpress_huff_decompress(
 
     uint32_t opos = 0;
     while (opos < out_len) {
-        /* ensure_bits(MAXCL=15) before Huffman decode */
         ENSURE_BITS(MAXCL);
 
-        /* Decode symbol from top TBLBITS bits */
         uint32_t idx = bits >> (32 - TBLBITS);
         uint16_t sym = tbl[idx].sym;
         int slen     = tbl[idx].len;
-        if (slen == 0) { free(tbl); return XPRESS_BAD_DATA; }
+        if (slen == 0) return XPRESS_BAD_DATA;
         bits <<= slen;
         nbits -= slen;
 
@@ -164,10 +153,8 @@ XpressStatus xpress_huff_decompress(
             int lh = mi & 0xF;
             int ol = mi >> 4;
 
-            /* ensure_bits(16) before offset extra bits */
             ENSURE_BITS(16);
 
-            /* Match offset from extra bits */
             uint32_t moff;
             if (ol == 0) {
                 moff = 1;
@@ -177,28 +164,26 @@ XpressStatus xpress_huff_decompress(
                 nbits -= ol;
             }
 
-            /* Match length - extension bytes read from stream pointer */
             uint32_t mlen;
             if (lh < 15) {
                 mlen = (uint32_t)lh + 3;
             } else {
-                /* Length extension bytes from stream pointer */
-                if (p >= end) { free(tbl); return XPRESS_BAD_DATA; }
+                if (p >= end) return XPRESS_BAD_DATA;
                 uint8_t xb = *p++;
                 if (xb < 255) {
                     mlen = 15 + 3 + xb;
                 } else {
-                    if (p + 1 >= end) { free(tbl); return XPRESS_BAD_DATA; }
+                    if (p + 1 >= end) return XPRESS_BAD_DATA;
                     mlen = rd16(p); p += 2;
                     if (mlen == 0) {
-                        if (p + 3 >= end) { free(tbl); return XPRESS_BAD_DATA; }
+                        if (p + 3 >= end) return XPRESS_BAD_DATA;
                         mlen = rd32(p); p += 4;
                     }
-                    mlen += 3; /* MS-XCA: +3 applied after uint16/uint32 read */
+                    mlen += 3;
                 }
             }
 
-            if (moff > opos) { free(tbl); return XPRESS_BAD_DATA; }
+            if (moff > opos) return XPRESS_BAD_DATA;
             for (uint32_t j = 0; j < mlen && opos < out_len; j++) {
                 out[opos] = out[opos - moff];
                 opos++;
@@ -207,8 +192,33 @@ XpressStatus xpress_huff_decompress(
     }
 
 #undef ENSURE_BITS
-    free(tbl);
     return XPRESS_OK;
+}
+
+/* Heap-allocating decompressor (original API) */
+XpressStatus xpress_huff_decompress(
+    const uint8_t* in, uint32_t in_len,
+    uint8_t* out, uint32_t out_len)
+{
+    if (in_len < HTBL_BYTES) return XPRESS_BAD_DATA;
+
+    DEntry* tbl = (DEntry*)malloc(sizeof(DEntry) * TBLSZ);
+    if (!tbl) return XPRESS_BAD_DATA;
+
+    XpressStatus st = decompress_core(in, in_len, out, out_len, tbl);
+    free(tbl);
+    return st;
+}
+
+/* Static decompressor: no malloc, caller provides workspace.
+ * workspace must be at least XPRESS_DECOMPRESS_WORKSPACE_SIZE bytes. */
+XpressStatus xpress_huff_decompress_static(
+    const uint8_t* in, uint32_t in_len,
+    uint8_t* out, uint32_t out_len,
+    void* workspace)
+{
+    if (in_len < HTBL_BYTES || !workspace) return XPRESS_BAD_DATA;
+    return decompress_core(in, in_len, out, out_len, (DEntry*)workspace);
 }
 
 /*======================================================================

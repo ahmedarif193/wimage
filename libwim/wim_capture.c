@@ -13,14 +13,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <dirent.h>
 #include <fcntl.h>
-#ifndef _WIN32
 #include <sys/mman.h>
-#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
+#ifdef _WIN32
+/* Capture not yet supported on Windows */
+int wim_capture_dir(const char* source_dir, WimDentry* root,
+                    wim_blob_writer_fn writer, void* user)
+{
+    (void)source_dir; (void)root; (void)writer; (void)user;
+    fprintf(stderr, "Error: capture is not supported on Windows\n");
+    return -1;
+}
+#else
 
 #define MMAP_CAPTURE_THRESHOLD (1u << 20)
 
@@ -231,3 +245,5 @@ int wim_capture_dir(const char* source_dir, WimDentry* root,
 
     return 0;
 }
+
+#endif /* !_WIN32 */
