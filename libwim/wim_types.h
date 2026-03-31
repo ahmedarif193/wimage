@@ -100,13 +100,16 @@ static inline void wim_dentry_init(WimDentry* d) {
     d->security_id = -1;
 }
 
-static inline void wim_dentry_add_child(WimDentry* parent, WimDentry child) {
+static inline int wim_dentry_add_child(WimDentry* parent, WimDentry child) {
     if (parent->child_count >= parent->child_cap) {
         size_t newcap = parent->child_cap ? parent->child_cap * 2 : 8;
-        parent->children = (WimDentry*)realloc(parent->children, newcap * sizeof(WimDentry));
+        WimDentry* tmp = (WimDentry*)realloc(parent->children, newcap * sizeof(WimDentry));
+        if (!tmp) return -1;
+        parent->children = tmp;
         parent->child_cap = newcap;
     }
     parent->children[parent->child_count++] = child;
+    return 0;
 }
 
 static inline void wim_dentry_free(WimDentry* d) {
@@ -126,8 +129,9 @@ static inline void wim_ctx_init(WimCtx* ctx) {
 static inline int wim_ctx_add_blob(WimCtx* ctx, const WimBlob* blob) {
     if (ctx->blob_count >= ctx->blob_cap) {
         size_t newcap = ctx->blob_cap ? ctx->blob_cap * 2 : 64;
-        ctx->blobs = (WimBlob*)realloc(ctx->blobs, newcap * sizeof(WimBlob));
-        if (!ctx->blobs) return -1;
+        WimBlob* tmp = (WimBlob*)realloc(ctx->blobs, newcap * sizeof(WimBlob));
+        if (!tmp) return -1;
+        ctx->blobs = tmp;
         ctx->blob_cap = newcap;
     }
     ctx->blobs[ctx->blob_count++] = *blob;

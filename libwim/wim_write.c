@@ -422,8 +422,9 @@ static int serialize_dentry_tree(const WimDentry* root, uint8_t** out_buf, size_
     if (root->attributes & WIM_FILE_ATTRIBUTE_DIRECTORY) {
         if (g_count >= g_cap) {
             g_cap *= 2;
-            groups = (ChildGroup*)realloc(groups, g_cap * sizeof(ChildGroup));
-            if (!groups) return -1;
+            ChildGroup* tmp = (ChildGroup*)realloc(groups, g_cap * sizeof(ChildGroup));
+            if (!tmp) { free(groups); return -1; }
+            groups = tmp;
         }
         groups[g_count].parent = root;
         groups[g_count].parent_buf_offset = root_offset;
@@ -441,8 +442,9 @@ static int serialize_dentry_tree(const WimDentry* root, uint8_t** out_buf, size_
 
         if (go_count >= go_cap) {
             go_cap *= 2;
-            group_offsets = (size_t*)realloc(group_offsets, go_cap * sizeof(size_t));
-            if (!group_offsets) { free(groups); return -1; }
+            size_t* tmp_go = (size_t*)realloc(group_offsets, go_cap * sizeof(size_t));
+            if (!tmp_go) { free(group_offsets); free(groups); return -1; }
+            group_offsets = tmp_go;
         }
         group_offsets[go_count++] = pos;
 
@@ -455,8 +457,9 @@ static int serialize_dentry_tree(const WimDentry* root, uint8_t** out_buf, size_
             if (child->attributes & WIM_FILE_ATTRIBUTE_DIRECTORY) {
                 if (g_count >= g_cap) {
                     g_cap *= 2;
-                    groups = (ChildGroup*)realloc(groups, g_cap * sizeof(ChildGroup));
-                    if (!groups) { free(group_offsets); return -1; }
+                    ChildGroup* tmp_g = (ChildGroup*)realloc(groups, g_cap * sizeof(ChildGroup));
+                    if (!tmp_g) { free(groups); free(group_offsets); return -1; }
+                    groups = tmp_g;
                 }
                 groups[g_count].parent = child;
                 groups[g_count].parent_buf_offset = child_offset;

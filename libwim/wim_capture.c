@@ -140,7 +140,11 @@ static int capture_recursive(const char* full_path, const char* name,
                 closedir(dir);
                 return ret;
             }
-            wim_dentry_add_child(dentry, child);
+            if (wim_dentry_add_child(dentry, child) != 0) {
+                wim_dentry_free(&child);
+                closedir(dir);
+                return -1;
+            }
         }
         closedir(dir);
 
@@ -211,7 +215,11 @@ int wim_capture_dir(const char* source_dir, WimDentry* root,
             closedir(dir);
             return ret;
         }
-        wim_dentry_add_child(root, child);
+        if (wim_dentry_add_child(root, child) != 0) {
+            wim_dentry_free(&child);
+            closedir(dir);
+            return -1;
+        }
     }
     closedir(dir);
 

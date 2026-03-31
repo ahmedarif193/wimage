@@ -374,7 +374,11 @@ static int deserialize_dentry_tree(const uint8_t* buf, uint64_t len, WimDentry* 
             uint64_t child_next;
             if (!deserialize_one_dentry(buf, len, off, &child, &child_next))
                 break;
-            wim_dentry_add_child(parent, child);
+            if (wim_dentry_add_child(parent, child) != 0) {
+                wim_dentry_free(&child);
+                free(queue);
+                return -1;
+            }
             off = child_next;
         }
 
@@ -383,9 +387,12 @@ static int deserialize_dentry_tree(const uint8_t* buf, uint64_t len, WimDentry* 
             if ((ch->attributes & WIM_FILE_ATTRIBUTE_DIRECTORY) && ch->subdir_offset > 0) {
                 if (q_tail >= q_cap) {
                     q_cap *= 2;
-                    queue = (WimDentry**)realloc(queue, q_cap * sizeof(WimDentry*));
-                    if (!queue)
+                    WimDentry** tmp_q = (WimDentry**)realloc(queue, q_cap * sizeof(WimDentry*));
+                    if (!tmp_q) {
+                        free(queue);
                         return -1;
+                    }
+                    queue = tmp_q;
                 }
                 queue[q_tail++] = ch;
             }
