@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Generate version
+      id: version
+      run: |
+        DATE=$(date -u +%Y%m%d)
+        SHORT=$(git rev-parse --short HEAD)
+        COUNT=$(git rev-list --count HEAD)
+        VERSION="0.2.${COUNT}"
+        TAG="v${VERSION}"
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libssl-dev wimtools
+
+    - name: Build
+      run: |
+        cmake -B build -DENABLE_TESTS=ON \
+          -DCMAKE_C_FLAGS="-D_FILE_OFFSET_BITS=64"
+        cmake --build build -j$(nproc)
+
+    - name: Unit tests
+      working-directory: build
+      run: ./wimage_tests
+
+    - name: Integration tests
+      run: WIMAGE_BIN=$PWD/build/wimage python3 scripts/test_compare.py
+
+    - name: Build .deb
+      run: |
+        VERSION=${{ steps.version.outputs.version }}
+        mkdir -p pkg/DEBIAN pkg/usr/bin
+        cp build/wimage pkg/usr/bin/wimage
+        strip pkg/usr/bin/wimage
+        cat > pkg/DEBIAN/control <<EOF
+        Package: wimage
+        Version: ${VERSION}
+        Section: utils
+        Priority: optional
+        Architecture: amd64
+        Depends: libc6 (>= 2.17), libssl3 | libssl1.1
+        Maintainer: Ahmed ARIF <arif.ing@outlook.com>
+        Description: Clean-room WIM image tool
+         Capture, apply, and verify Windows Imaging Format (WIM) files.
+         Supports XPRESS Huffman compression with multi-threaded capture.
+        EOF
+        sed -i 's/^        //' pkg/DEBIAN/control
+        dpkg-deb --root-owner-group --build pkg wimage_${VERSION}_amd64.deb
+
+    - name: Upload .deb
+      uses: actions/upload-artifact@v4
+      with:
+        name: deb-package
+        path: wimage_*.deb
+
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install mingw
+      run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+
+    - name: Build Windows exe
+      run: |
+        for f in libwim/sha1.c libwim/xpress_huff.c libwim/wim_io.c \
+                 libwim/wim_read.c libwim/wim_write.c libwim/wim_capture.c \
+                 wimage.c; do
+          x86_64-w64-mingw32-gcc -std=c11 -Wall -Wextra -O2 \
+            -D_FILE_OFFSET_BITS=64 -Ilibwim \
+            -c "$f" -o "${f%.c}.o"
+        done
+        x86_64-w64-mingw32-ar rcs libwim/libwim.a \
+          libwim/sha1.o libwim/xpress_huff.o libwim/wim_io.o \
+          libwim/wim_read.o libwim/wim_write.o libwim/wim_capture.o
+        x86_64-w64-mingw32-gcc -std=c11 -O2 -o wimage.exe \
+          wimage.o libwim/libwim.a -static
+        x86_64-w64-mingw32-strip wimage.exe
+
+    - name: Upload .exe
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-exe
+        path: wimage.exe
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+
+    - name: Create source tarball
+      run: |
+        VERSION=${{ needs.build-linux.outputs.version }}
+        git archive --format=tar.gz --prefix=wimage-${VERSION}/ HEAD \
+          -o wimage-${VERSION}-src.tar.gz
+
+    - name: Create tag
+      run: |
+        TAG=${{ needs.build-linux.outputs.tag }}
+        git tag "${TAG}" || true
+        git push origin "${TAG}" || true
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ needs.build-linux.outputs.tag }}
+        name: wimage ${{ needs.build-linux.outputs.tag }}
+        generate_release_notes: true
+        files: |
+          deb-package/wimage_*.deb
+          windows-exe/wimage.exe
+          wimage-*-src.tar.gz

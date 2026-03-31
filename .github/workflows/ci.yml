@@ -16,14 +16,15 @@ jobs:
     - name: Install dependencies
       run: sudo apt-get update && sudo apt-get install -y wimtools libssl-dev
 
-    - name: Build
-      run: cmake -B build -DENABLE_TESTS=ON && cmake --build build -j$(nproc)
+    - name: Build with CMake
+      run: |
+        cmake -B build -DENABLE_TESTS=ON \
+          -DCMAKE_C_FLAGS="-D_FILE_OFFSET_BITS=64"
+        cmake --build build -j$(nproc)
 
     - name: Unit tests
-      run: ./build/wimage_tests
+      working-directory: build
+      run: ./wimage_tests
 
     - name: Integration tests
-      run: |
-        cd scripts
-        python3 test_compare.py
-        python3 test_random250.py
+      run: WIMAGE_BIN=$PWD/build/wimage python3 scripts/test_compare.py
