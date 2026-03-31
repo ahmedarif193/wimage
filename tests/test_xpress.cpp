@@ -300,6 +300,44 @@ TEST(Xpress, RoundTrip_SmallBuffer)
     }
 }
 
+TEST(Xpress, RoundTrip_HighEntropy32K)
+{
+    /* 32KB of high-entropy data with all 256 byte values active and sparse
+     * matches. This triggers the Huffman tree depth > MAXCL case where
+     * the Kraft inequality repair can overflow if not properly validated.
+     * Regression: compressor produced invalid Huffman codes for certain
+     * binary PE data patterns, causing decompressor heap-buffer-overflow. */
+    std::vector<uint8_t> data(32768);
+    srand(0xDEAD);
+    for (auto& b : data) b = (uint8_t)(rand() & 0xFF);
+    /* Inject sparse short matches to create many active match symbols */
+    for (size_t i = 256; i < data.size() - 4; i += 97) {
+        size_t src = (rand() % 200) + 3;
+        if (src < i) { data[i] = data[src]; data[i+1] = data[src+1]; data[i+2] = data[src+2]; }
+    }
+    roundtrip(data.data(), (uint32_t)data.size());
+}
+
+TEST(Xpress, KraftOverflow_ManySymbols)
+{
+    /* Create data that activates many of the 512 XPRESS symbols (256 literals
+     * + many match length/offset combinations) to stress the Huffman tree
+     * depth limit. The compressor must either produce valid codes or fall
+     * back to raw storage -- never produce corrupt output. */
+    std::vector<uint8_t> data(32768);
+    srand(0xBEEF);
+    for (auto& b : data) b = (uint8_t)(rand() & 0xFF);
+    /* Many short matches at various offsets */
+    for (size_t i = 64; i < data.size() - 8; i += 31) {
+        size_t off = (rand() % 60) + 3;
+        if (off < i) {
+            for (int k = 0; k < 3 + (rand() % 5); k++)
+                if (i + k < data.size()) data[i+k] = data[i - off + k];
+        }
+    }
+    roundtrip(data.data(), (uint32_t)data.size());
+}
+
 /* ================================================================
  * Larger round-trip tests
  * ================================================================ */

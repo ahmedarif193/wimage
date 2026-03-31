@@ -224,6 +224,14 @@ def make_deep_tree(root):
     _write(path, "bottom.txt", b"At the bottom\n")
 
 
+def make_small_files_tree(root):
+    """Tree with very small files (1-16 bytes) to stress compressor boundaries."""
+    os.makedirs(root, exist_ok=True)
+    for sz in [1, 2, 3, 4, 8, 15, 16]:
+        content = bytes((0x40 + i) & 0xFF for i in range(sz))
+        _write(root, f"file_{sz}b.bin", content)
+
+
 def _write(root, relpath, content):
     full = os.path.join(root, relpath)
     os.makedirs(os.path.dirname(full), exist_ok=True)
@@ -617,6 +625,60 @@ class TestCompressionRatio(WimCompareBase):
         self.assertGreater(ratio, 0.5, f"Our WIM is {ratio:.1f}x wimlib's size - suspiciously small")
 
 
+class TestUniformDataCompression(WimCompareBase):
+    """Uniform/zeros data must compress well and round-trip correctly."""
+
+    def test_zeros_compress_well(self):
+        """64KB all-zeros file must compress significantly with XPRESS."""
+        src = self.path("src")
+        os.makedirs(src)
+        _write(src, "zeros.bin", b"\x00" * 65536)
+        wim = self.path("test.wim")
+        self.capture_wimage(src, wim, compress="xpress")
+        sz = os.path.getsize(wim)
+        self.assertLess(sz, 65536 * 0.5,
+                        f"WIM size {sz} too large for 64KB zeros - compression not working")
+
+    def test_uniform_byte_compresses(self):
+        """64KB of 0xAA must compress and round-trip through wimlib."""
+        src = self.path("src")
+        os.makedirs(src)
+        _write(src, "uniform.bin", b"\xAA" * 65536)
+        wim = self.path("test.wim")
+        out = self.path("out")
+        self.capture_wimage(src, wim, compress="xpress")
+        sz = os.path.getsize(wim)
+        self.assertLess(sz, 65536 * 0.5,
+                        f"WIM size {sz} too large for uniform data")
+        self.apply_wimlib(wim, out)
+        self.assertEqual(sha256_tree(src), sha256_tree(out))
+
+    def test_zeros_roundtrip_wimlib(self):
+        """Compressed zeros from wimage decompress correctly via wimlib."""
+        src = self.path("src")
+        os.makedirs(src)
+        _write(src, "z64k.bin", b"\x00" * 65536)
+        _write(src, "z32k.bin", b"\x00" * 32768)
+        _write(src, "tiny.txt", b"x")
+        wim = self.path("test.wim")
+        out = self.path("out")
+        self.capture_wimage(src, wim, compress="xpress")
+        self.apply_wimlib(wim, out)
+        self.assertEqual(sha256_tree(src), sha256_tree(out))
+
+    def test_zeros_roundtrip_wimage(self):
+        """Compressed zeros from wimlib decompress correctly via wimage."""
+        src = self.path("src")
+        os.makedirs(src)
+        _write(src, "zeros.bin", b"\x00" * 65536)
+        wim = self.path("test.wim")
+        out = self.path("out")
+        self.capture_wimlib(src, wim, compress="XPRESS")
+        self.apply_wimage(wim, out)
+        self.assertEqual(sha256_tree(src), sha256_tree(out))
+
+
+
 class TestDeduplication(WimCompareBase):
     """Files with identical content must share a single blob."""
 
@@ -723,6 +785,62 @@ class TestEdgeCases(WimCompareBase):
         self.assertEqual(sha256_tree(src), sha256_tree(out))
 
 
+class TestSmallFileRoundtrip(WimCompareBase):
+    """Very small files (1-16 bytes) must survive XPRESS compression."""
+
+    def test_tiny_files_xpress_roundtrip(self):
+        """Files 1-16 bytes: wimage capture XPRESS -> wimage apply."""
+        src = self.path("src")
+        make_small_files_tree(src)
+        wim = self.path("test.wim")
+        out = self.path("out")
+        self.capture_wimage(src, wim, compress="xpress")
+        self.apply_wimage(wim, out)
+        self.assertEqual(sha256_tree(src), sha256_tree(out))
+
+    def test_tiny_files_xpress_wimlib_reads(self):
+        """Files 1-16 bytes: wimage capture XPRESS -> wimlib apply."""
+        src = self.path("src")
+        make_small_files_tree(src)
+        wim = self.path("test.wim")
+        out = self.path("out")
+        self.capture_wimage(src, wim, compress="xpress")
+        self.apply_wimlib(wim, out)
+        self.assertEqual(sha256_tree(src), sha256_tree(out))
+
+    def test_tiny_files_xpress_threaded(self):
+        """Files 1-16 bytes: threaded XPRESS capture must not crash."""
+        src = self.path("src")
+        make_small_files_tree(src)
+        wim = self.path("test.wim")
+        out = self.path("out")
+        self.capture_wimage(src, wim, compress="xpress", threads=4)
+        self.apply_wimage(wim, out)
+        self.assertEqual(sha256_tree(src), sha256_tree(out))
+
+    def test_single_byte_file_xpress(self):
+        """1-byte file survives XPRESS + wimlib round-trip."""
+        src = self.path("src")
+        os.makedirs(src)
+        _write(src, "one.bin", b"Z")
+        wim = self.path("test.wim")
+        out = self.path("out")
+        self.capture_wimage(src, wim, compress="xpress")
+        self.apply_wimlib(wim, out)
+        self.assertEqual(sha256_tree(src), sha256_tree(out))
+
+    def test_two_byte_file_xpress(self):
+        """2-byte file (h3 boundary) survives XPRESS + wimlib round-trip."""
+        src = self.path("src")
+        os.makedirs(src)
+        _write(src, "two.bin", b"AB")
+        wim = self.path("test.wim")
+        out = self.path("out")
+        self.capture_wimage(src, wim, compress="xpress")
+        self.apply_wimlib(wim, out)
+        self.assertEqual(sha256_tree(src), sha256_tree(out))
+
+
 class TestIntegrity(WimCompareBase):
     """Integrity table generation and verification."""
 
@@ -774,6 +892,33 @@ class TestIntegrity(WimCompareBase):
         self.assertEqual(rc, 0, "Threaded integrity verification should pass")
         self.apply_wimlib(wim, out)
         self.assertEqual(sha256_tree(src), sha256_tree(out))
+
+    def test_wimlib_verify_our_integrity_none(self):
+        """wimlib-imagex verify must pass on our uncompressed WIM with integrity."""
+        src = self.path("src")
+        make_basic_tree(src)
+        wim = self.path("test.wim")
+        self.capture_wimage(src, wim, compress="none", check=True)
+        rc, _, err = run([WIMLIB, "verify", wim], check=False)
+        self.assertEqual(rc, 0, f"wimlib verify failed: {err}")
+
+    def test_wimlib_verify_our_integrity_xpress(self):
+        """wimlib-imagex verify must pass on our XPRESS WIM with integrity."""
+        src = self.path("src")
+        make_basic_tree(src)
+        wim = self.path("test.wim")
+        self.capture_wimage(src, wim, compress="xpress", check=True)
+        rc, _, err = run([WIMLIB, "verify", wim], check=False)
+        self.assertEqual(rc, 0, f"wimlib verify failed: {err}")
+
+    def test_wimlib_verify_our_integrity_large(self):
+        """wimlib-imagex verify must pass on threaded XPRESS with >1MB files."""
+        src = self.path("src")
+        make_huge_tree(src)
+        wim = self.path("test.wim")
+        self.capture_wimage(src, wim, compress="xpress", check=True, threads=8)
+        rc, _, err = run([WIMLIB, "verify", wim], check=False)
+        self.assertEqual(rc, 0, f"wimlib verify failed on large WIM: {err}")
 
 
 # ---------------------------------------------------------------------------

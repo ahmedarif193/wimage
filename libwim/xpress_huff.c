@@ -99,6 +99,7 @@ static int build_dtable(const uint8_t cl[NSYM], DEntry tbl[TBLSZ])
         /* top-L-bit match in a TBLBITS-wide index */
         uint32_t base = c << (TBLBITS - L);
         uint32_t span = 1u << (TBLBITS - L);
+        if (base + span > TBLSZ) return 0;
         for (uint32_t j = 0; j < span; j++) {
             tbl[base + j].sym = (uint16_t)s;
             tbl[base + j].len = (uint8_t)L;
@@ -305,6 +306,14 @@ static void make_lengths(const uint32_t freq[NSYM], uint8_t cl[NSYM])
                     if (best < 0 || cl[i] < cl[best]) best = i;
             if (best < 0) break;
             cl[best]++;
+        }
+        /* Final Kraft check: if still oversubscribed, fall back to MAXCL for all */
+        uint32_t k = 0;
+        for (int i = 0; i < NSYM; i++)
+            if (cl[i]) k += 1u << (MAXCL - cl[i]);
+        if (k > (1u << MAXCL)) {
+            for (int i = 0; i < NSYM; i++)
+                if (cl[i]) cl[i] = MAXCL;
         }
     }
 }
@@ -608,6 +617,17 @@ XpressStatus xpress_huff_compress_prechecked_with_scratch(
 
     uint8_t cl[NSYM];
     make_lengths(freq, cl);
+
+    /* Verify Kraft inequality before encoding: if code lengths are invalid,
+     * bail out and let the caller store the chunk raw. */
+    {
+        uint32_t kraft = 0;
+        for (int i = 0; i < NSYM; i++)
+            if (cl[i]) kraft += 1u << (MAXCL - cl[i]);
+        if (kraft > (1u << MAXCL))
+            return XPRESS_BUFFER_TOO_SMALL;
+    }
+
     uint32_t codes[NSYM];
     make_codes(cl, codes);
 
