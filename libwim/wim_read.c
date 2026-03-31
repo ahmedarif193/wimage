@@ -24,7 +24,7 @@
 
 static int read_header(WimCtx* ctx)
 {
-    if (fseek(ctx->file, 0, SEEK_SET) != 0)
+    if (fseeko(ctx->file, 0, SEEK_SET) != 0)
         return -1;
 
     if (fread(&ctx->header, sizeof(WimHeader), 1, ctx->file) != 1)
@@ -58,7 +58,7 @@ static int read_lookup_table(WimCtx* ctx)
     if (tbl_orig_size == 0)
         return 0;
 
-    if (fseek(ctx->file, (long)tbl_offset, SEEK_SET) != 0)
+    if (fseeko(ctx->file, (off_t)tbl_offset, SEEK_SET) != 0)
         return -1;
 
     uint8_t* raw = (uint8_t*)malloc((size_t)tbl_comp_size);
@@ -118,7 +118,7 @@ static int read_xml_data(WimCtx* ctx)
     if (xml_size == 0)
         return 0;
 
-    if (fseek(ctx->file, (long)xml_offset, SEEK_SET) != 0)
+    if (fseeko(ctx->file, (off_t)xml_offset, SEEK_SET) != 0)
         return -1;
 
     ctx->xml_raw = (uint8_t*)malloc((size_t)xml_size);
@@ -149,7 +149,7 @@ static int read_xml_data(WimCtx* ctx)
 static int read_resource(WimCtx* ctx, const WimBlob* blob,
                          uint8_t** out_data, size_t* out_size)
 {
-    if (fseek(ctx->file, (long)blob->offset, SEEK_SET) != 0)
+    if (fseeko(ctx->file, (off_t)blob->offset, SEEK_SET) != 0)
         return -1;
 
     int compressed = (blob->flags & WIM_RESHDR_FLAG_COMPRESSED) != 0 &&
@@ -732,7 +732,7 @@ int wim_verify_integrity(WimCtx* ctx)
         return -1;
     }
 
-    fseek(ctx->file, (long)integ_offset, SEEK_SET);
+    fseeko(ctx->file, (off_t)integ_offset, SEEK_SET);
 
     uint32_t table_size, num_entries, chunk_size;
     if (fread(&table_size, 4, 1, ctx->file) != 1) return -1;
@@ -758,7 +758,7 @@ int wim_verify_integrity(WimCtx* ctx)
         return -1;
     }
 
-    fseek(ctx->file, (long)data_start, SEEK_SET);
+    fseeko(ctx->file, (off_t)data_start, SEEK_SET);
     uint64_t remaining = data_size;
 
     for (uint32_t i = 0; i < num_entries; i++) {

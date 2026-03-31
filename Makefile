@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -std=c11 -Wall -Wextra -O2 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
+CFLAGS = -std=c11 -Wall -Wextra -O2 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -D_FILE_OFFSET_BITS=64
 TARGET = native-wimage
 OPENSSL_FOUND := $(shell pkg-config --exists openssl && echo 1 || echo 0)
 
