@@ -67,6 +67,14 @@ typedef struct {
     WimBlob   metadata_blob;
 } WimImageData;
 
+/* SHA-1 hash table for O(1) blob dedup lookup */
+#define WIM_BLOB_HT_EMPTY ((uint32_t)-1)
+
+typedef struct {
+    uint32_t* slots;   /* blob index per slot, WIM_BLOB_HT_EMPTY = unused */
+    size_t    capacity;
+} WimBlobHT;
+
 /* Main WIM context (replaces CWimImage class) */
 typedef struct {
     FILE*       file;
@@ -79,6 +87,7 @@ typedef struct {
     WimBlob*    blobs;
     size_t      blob_count;
     size_t      blob_cap;
+    WimBlobHT   blob_ht;
 
     /* Images */
     WimImageData* images;
@@ -125,6 +134,31 @@ static inline void wim_ctx_init(WimCtx* ctx) {
     memset(ctx, 0, sizeof(*ctx));
 }
 
+/* Blob hash table helpers */
+static inline uint32_t wim_blob_ht_hash(const uint8_t sha1[20]) {
+    uint32_t h;
+    memcpy(&h, sha1, 4);
+    return h;
+}
+
+static inline int wim_blob_ht_grow(WimBlobHT* ht, const WimBlob* blobs, size_t blob_count) {
+    size_t newcap = ht->capacity ? ht->capacity * 2 : 256;
+    uint32_t* newslots = (uint32_t*)malloc(newcap * sizeof(uint32_t));
+    if (!newslots) return -1;
+    memset(newslots, 0xFF, newcap * sizeof(uint32_t)); /* fill with EMPTY */
+    /* Re-insert all existing entries */
+    for (size_t i = 0; i < blob_count; i++) {
+        uint32_t idx = wim_blob_ht_hash(blobs[i].sha1.hash) & (uint32_t)(newcap - 1);
+        while (newslots[idx] != WIM_BLOB_HT_EMPTY)
+            idx = (idx + 1) & (uint32_t)(newcap - 1);
+        newslots[idx] = (uint32_t)i;
+    }
+    free(ht->slots);
+    ht->slots = newslots;
+    ht->capacity = newcap;
+    return 0;
+}
+
 /* Blob table: add entry, find by SHA-1 */
 static inline int wim_ctx_add_blob(WimCtx* ctx, const WimBlob* blob) {
     if (ctx->blob_count >= ctx->blob_cap) {
@@ -134,14 +168,30 @@ static inline int wim_ctx_add_blob(WimCtx* ctx, const WimBlob* blob) {
         ctx->blobs = tmp;
         ctx->blob_cap = newcap;
     }
+    /* Grow hash table at 75% load */
+    if (ctx->blob_ht.capacity == 0 || ctx->blob_count * 4 >= ctx->blob_ht.capacity * 3) {
+        if (wim_blob_ht_grow(&ctx->blob_ht, ctx->blobs, ctx->blob_count) != 0)
+            return -1;
+    }
+    /* Insert into hash table */
+    uint32_t idx = wim_blob_ht_hash(blob->sha1.hash) & (uint32_t)(ctx->blob_ht.capacity - 1);
+    while (ctx->blob_ht.slots[idx] != WIM_BLOB_HT_EMPTY)
+        idx = (idx + 1) & (uint32_t)(ctx->blob_ht.capacity - 1);
+    ctx->blob_ht.slots[idx] = (uint32_t)ctx->blob_count;
+
     ctx->blobs[ctx->blob_count++] = *blob;
     return 0;
 }
 
 static inline int wim_ctx_find_blob(const WimCtx* ctx, const uint8_t sha1[20]) {
-    for (size_t i = 0; i < ctx->blob_count; i++) {
-        if (memcmp(ctx->blobs[i].sha1.hash, sha1, 20) == 0)
-            return (int)i;
+    if (ctx->blob_ht.capacity == 0)
+        return -1;
+    uint32_t idx = wim_blob_ht_hash(sha1) & (uint32_t)(ctx->blob_ht.capacity - 1);
+    while (ctx->blob_ht.slots[idx] != WIM_BLOB_HT_EMPTY) {
+        uint32_t bi = ctx->blob_ht.slots[idx];
+        if (memcmp(ctx->blobs[bi].sha1.hash, sha1, 20) == 0)
+            return (int)bi;
+        idx = (idx + 1) & (uint32_t)(ctx->blob_ht.capacity - 1);
     }
     return -1;
 }
@@ -149,6 +199,7 @@ static inline int wim_ctx_find_blob(const WimCtx* ctx, const uint8_t sha1[20]) {
 static inline void wim_ctx_free(WimCtx* ctx) {
     if (ctx->file) { fclose(ctx->file); ctx->file = NULL; }
     free(ctx->blobs);
+    free(ctx->blob_ht.slots);
     if (ctx->images) {
         for (size_t i = 0; i < ctx->image_count; i++)
             wim_dentry_free(&ctx->images[i].root);
