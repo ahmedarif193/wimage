@@ -16,6 +16,12 @@
 #include <string.h>
 #include <time.h>
 
+/* Checked fwrite: returns -1 on short write */
+static inline int wim_fwrite(const void* buf, size_t size, FILE* f)
+{
+    return (fwrite(buf, 1, size, f) == size) ? 0 : -1;
+}
+
 #ifndef _WIN32
 #include <pthread.h>
 #endif
@@ -231,8 +237,8 @@ static int write_blob(WimCtx* ctx, const uint8_t* data_ptr, uint64_t size,
                 free(work[i].owns_out ? work[i].out : NULL);
             free(work);
 
-            if (size > 0)
-                fwrite(data_ptr, 1, (size_t)size, ctx->file);
+            if (size > 0 && wim_fwrite(data_ptr, (size_t)size, ctx->file) != 0)
+                return -1;
             written_size = size;
             goto blob_done;
         }
@@ -252,7 +258,10 @@ static int write_blob(WimCtx* ctx, const uint8_t* data_ptr, uint64_t size,
                     memcpy(table_buf + i * 4, &val, 4);
                 }
             }
-            fwrite(table_buf, 1, table_size, ctx->file);
+            if (wim_fwrite(table_buf, table_size, ctx->file) != 0) {
+                free(table_buf);
+                goto comp_fail;
+            }
             free(table_buf);
         }
 
@@ -268,10 +277,12 @@ static int write_blob(WimCtx* ctx, const uint8_t* data_ptr, uint64_t size,
                     run_size += work[j].in_len;
                     j++;
                 }
-                fwrite(work[i].in, 1, run_size, ctx->file);
+                if (wim_fwrite(work[i].in, run_size, ctx->file) != 0)
+                    goto comp_fail;
                 i = j;
             } else {
-                fwrite(work[i].out, 1, work[i].out_len, ctx->file);
+                if (wim_fwrite(work[i].out, work[i].out_len, ctx->file) != 0)
+                    goto comp_fail;
                 i++;
             }
         }
@@ -302,8 +313,8 @@ comp_fail:
         }
 
         /* Write uncompressed */
-        if (size > 0)
-            fwrite(data_ptr, 1, (size_t)size, ctx->file);
+        if (size > 0 && wim_fwrite(data_ptr, (size_t)size, ctx->file) != 0)
+            return -1;
         written_size = size;
     }
 
@@ -562,7 +573,8 @@ static int write_lookup_table(WimCtx* ctx)
         entry.ref_count = ctx->blobs[i].ref_count;
         memcpy(entry.sha1, ctx->blobs[i].sha1.hash, 20);
 
-        fwrite(&entry, WIM_LOOKUP_ENTRY_SIZE, 1, ctx->file);
+        if (wim_fwrite(&entry, WIM_LOOKUP_ENTRY_SIZE, ctx->file) != 0)
+            return -1;
     }
 
     uint64_t size = (uint64_t)ctx->blob_count * WIM_LOOKUP_ENTRY_SIZE;
@@ -691,10 +703,10 @@ static int write_xml_data(WimCtx* ctx)
 
     /* Write BOM */
     uint16_t bom = 0xFEFF;
-    fwrite(&bom, 2, 1, ctx->file);
+    if (wim_fwrite(&bom, 2, ctx->file) != 0) { free(utf16); return -1; }
 
     /* Write UTF-16LE data */
-    fwrite(utf16, 2, utf16_len, ctx->file);
+    if (wim_fwrite(utf16, 2 * utf16_len, ctx->file) != 0) { free(utf16); return -1; }
 
     uint64_t size = 2 + utf16_len * 2;
     reshdr_set(&ctx->header.xml_data, size, 0, offset, size);
@@ -750,10 +762,13 @@ static int write_integrity_table(WimCtx* ctx)
 
     /* Table header: size, num_entries, chunk_size */
     uint32_t table_size = 12 + num_chunks * 20;
-    fwrite(&table_size, 4, 1, ctx->file);
-    fwrite(&num_chunks, 4, 1, ctx->file);
-    fwrite(&chunk_size, 4, 1, ctx->file);
-    fwrite(hashes, 1, num_chunks * 20, ctx->file);
+    if (wim_fwrite(&table_size, 4, ctx->file) != 0 ||
+        wim_fwrite(&num_chunks, 4, ctx->file) != 0 ||
+        wim_fwrite(&chunk_size, 4, ctx->file) != 0 ||
+        wim_fwrite(hashes, num_chunks * 20, ctx->file) != 0) {
+        free(hashes);
+        return -1;
+    }
 
     free(hashes);
 
@@ -826,7 +841,8 @@ int wim_create(WimCtx* ctx, const char* filename, int use_xpress)
     /* Write placeholder header */
     uint8_t placeholder[WIM_HEADER_SIZE];
     memset(placeholder, 0, WIM_HEADER_SIZE);
-    fwrite(placeholder, 1, WIM_HEADER_SIZE, ctx->file);
+    if (wim_fwrite(placeholder, WIM_HEADER_SIZE, ctx->file) != 0)
+        return -1;
 
     return 0;
 }

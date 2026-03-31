@@ -668,8 +668,9 @@ int wim_extract_file(WimCtx* ctx, const WimDentry* d, const char* dest_path)
 
         FILE* f = fopen(dest_path, "wb");
         if (!f) { free(data); return -1; }
-        if (data_size > 0)
-            fwrite(data, 1, data_size, f);
+        if (data_size > 0 && fwrite(data, 1, data_size, f) != data_size) {
+            fclose(f); free(data); return -1;
+        }
         fclose(f);
         free(data);
     }
