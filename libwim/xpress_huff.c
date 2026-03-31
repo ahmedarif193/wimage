@@ -426,7 +426,7 @@ static int xpress_huff_likely_incompressible(const uint8_t* in, uint32_t in_len)
         uint16_t prev = last[hv];
         last[hv] = (uint16_t)pos;
 
-        if (prev != 0xFFFF && pos > (uint32_t)prev + stride) {
+        if (prev != 0xFFFF && pos >= (uint32_t)prev + stride) {
             uint32_t prev_word;
             memcpy(&prev_word, in + prev, sizeof(prev_word));
             if (prev_word == word && ++repeats >= repeat_goal)
@@ -524,11 +524,13 @@ XpressStatus xpress_huff_compress_prechecked_with_scratch(
     for (int i = 0; i < 32768; i++) head[i] = -1;
     memset(prev, 0xFF, WSIZE * sizeof(int32_t)); /* -1 */
 
-    /* Insert position into hash chain */
+    /* Insert position into hash chain (guard: need 3 bytes for h3) */
     #define HC_INSERT(p) do { \
-        uint32_t hv_ = h3(in + (p)); \
-        prev[(p) & (WSIZE-1)] = head[hv_]; \
-        head[hv_] = (int32_t)(p); \
+        if ((p) + 2 < in_len) { \
+            uint32_t hv_ = h3(in + (p)); \
+            prev[(p) & (WSIZE-1)] = head[hv_]; \
+            head[hv_] = (int32_t)(p); \
+        } \
     } while(0)
 
     /* Find best match at position p, store length in bl_, offset in bo_ */

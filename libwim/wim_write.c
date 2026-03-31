@@ -219,6 +219,24 @@ static int write_blob(WimCtx* ctx, const uint8_t* data_ptr, uint64_t size,
             }
         }
 
+        /* Check if compression actually saves space (table + chunks < original).
+         * If not, fall back to writing raw uncompressed data. */
+        uint64_t total_comp = table_size;
+        for (uint64_t i = 0; i < num_chunks; i++)
+            total_comp += work[i].out_len;
+
+        if (total_comp >= size) {
+            /* Compression didn't help - write raw */
+            for (uint64_t i = 0; i < num_chunks; i++)
+                free(work[i].owns_out ? work[i].out : NULL);
+            free(work);
+
+            if (size > 0)
+                fwrite(data_ptr, 1, (size_t)size, ctx->file);
+            written_size = size;
+            goto blob_done;
+        }
+
         /* Build and write chunk offset table */
         if (table_size > 0) {
             uint8_t* table_buf = (uint8_t*)calloc(1, table_size);
@@ -257,10 +275,6 @@ static int write_blob(WimCtx* ctx, const uint8_t* data_ptr, uint64_t size,
                 i++;
             }
         }
-
-        uint64_t total_comp = table_size;
-        for (uint64_t i = 0; i < num_chunks; i++)
-            total_comp += work[i].out_len;
 
         written_size = total_comp;
 
@@ -688,7 +702,9 @@ static int write_xml_data(WimCtx* ctx)
 
 static int write_integrity_table(WimCtx* ctx)
 {
-    uint64_t data_end = (uint64_t)ftell(ctx->file);
+    /* Integrity hashes cover from after the header to the start of XML data.
+     * XML data and integrity table itself are excluded from the hash range. */
+    uint64_t data_end = ctx->header.xml_data.offset;
     uint64_t data_start = WIM_HEADER_SIZE;
     uint64_t data_size = data_end - data_start;
 
@@ -725,9 +741,9 @@ static int write_integrity_table(WimCtx* ctx)
 
     free(read_buf);
 
-    /* Seek back to end to write integrity table */
-    fseek(ctx->file, (long)data_end, SEEK_SET);
-    uint64_t integ_offset = data_end;
+    /* Seek to end of file (after XML data) to write integrity table */
+    fseek(ctx->file, 0, SEEK_END);
+    uint64_t integ_offset = (uint64_t)ftell(ctx->file);
 
     /* Table header: size, num_entries, chunk_size */
     uint32_t table_size = 12 + num_chunks * 20;

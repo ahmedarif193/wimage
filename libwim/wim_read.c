@@ -739,9 +739,10 @@ int wim_verify_integrity(WimCtx* ctx)
         return -1;
     }
 
-    /* Compute SHA-1 over chunks from offset 208 */
+    /* Compute SHA-1 over chunks from offset 208 to start of XML data.
+     * XML data and integrity table are excluded from the hash range. */
     uint64_t data_start = WIM_HEADER_SIZE;
-    uint64_t data_size = integ_offset - data_start;
+    uint64_t data_size = ctx->header.xml_data.offset - data_start;
 
     uint8_t* read_buf = (uint8_t*)malloc(chunk_size);
     if (!read_buf) {
