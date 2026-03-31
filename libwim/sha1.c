@@ -79,15 +79,18 @@ void sha1_init(Sha1Ctx* ctx)
     ctx->count[1] = 0;
 }
 
-void sha1_update(Sha1Ctx* ctx, const uint8_t* data, uint32_t len)
+void sha1_update(Sha1Ctx* ctx, const uint8_t* data, uint64_t len)
 {
     uint32_t buf_used = ctx->count[1] & 63;
-    ctx->count[1] += len;
-    if (ctx->count[1] < len)
+    uint32_t len_lo = (uint32_t)len;
+    uint32_t len_hi = (uint32_t)(len >> 32);
+    ctx->count[1] += len_lo;
+    if (ctx->count[1] < len_lo)
         ctx->count[0]++;
+    ctx->count[0] += len_hi;
 
     if (buf_used + len < 64) {
-        memcpy(&ctx->buffer[buf_used], data, len);
+        memcpy(&ctx->buffer[buf_used], data, (size_t)len);
     } else {
         while (buf_used + len >= 64) {
             memcpy(ctx->buffer + buf_used, data, 64 - buf_used);
@@ -96,7 +99,7 @@ void sha1_update(Sha1Ctx* ctx, const uint8_t* data, uint32_t len)
             sha1_transform(ctx->state, ctx->buffer);
             buf_used = 0;
         }
-        memcpy(ctx->buffer + buf_used, data, len);
+        memcpy(ctx->buffer + buf_used, data, (size_t)len);
     }
 }
 
@@ -141,10 +144,10 @@ void sha1_final(Sha1Ctx* ctx, uint8_t digest[20])
     sha1_init(ctx);
 }
 
-void sha1_hash(const uint8_t* data, uint32_t len, uint8_t digest[20])
+void sha1_hash(const uint8_t* data, uint64_t len, uint8_t digest[20])
 {
 #ifdef HAVE_OPENSSL_SHA1
-    SHA1(data, len, digest);
+    SHA1(data, (size_t)len, digest);
 #else
     Sha1Ctx ctx;
     sha1_init(&ctx);

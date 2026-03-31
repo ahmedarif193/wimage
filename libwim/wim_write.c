@@ -176,7 +176,7 @@ static int write_blob(WimCtx* ctx, const uint8_t* data_ptr, uint64_t size,
             }
 
             if (started == thread_count) {
-                sha1_hash(data_ptr, (uint32_t)size, sha1_out);
+                sha1_hash(data_ptr, size, sha1_out);
                 hash_ready = 1;
             } else {
                 for (int j = started; j < thread_count; j++)
@@ -199,7 +199,7 @@ static int write_blob(WimCtx* ctx, const uint8_t* data_ptr, uint64_t size,
         }
 
         if (!hash_ready) {
-            sha1_hash(data_ptr, (uint32_t)size, sha1_out);
+            sha1_hash(data_ptr, size, sha1_out);
             hash_ready = 1;
         }
 
@@ -290,7 +290,7 @@ comp_fail:
         return -1;
 
     } else {
-        sha1_hash(data_ptr, (uint32_t)size, sha1_out);
+        sha1_hash(data_ptr, size, sha1_out);
         hash_ready = 1;
 
         if (!is_metadata) {

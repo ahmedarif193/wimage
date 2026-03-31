@@ -18,8 +18,8 @@ typedef struct {
 } Sha1Ctx;
 
 void sha1_init(Sha1Ctx* ctx);
-void sha1_update(Sha1Ctx* ctx, const uint8_t* data, uint32_t len);
+void sha1_update(Sha1Ctx* ctx, const uint8_t* data, uint64_t len);
 void sha1_final(Sha1Ctx* ctx, uint8_t digest[20]);
-void sha1_hash(const uint8_t* data, uint32_t len, uint8_t digest[20]);
+void sha1_hash(const uint8_t* data, uint64_t len, uint8_t digest[20]);
 
 #endif /* LIBWIM_SHA1_H */
