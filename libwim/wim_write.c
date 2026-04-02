@@ -560,6 +560,12 @@ static int write_metadata(WimCtx* ctx, int image_idx)
     int blob_idx = wim_ctx_find_blob(ctx, sha1_out);
     if (blob_idx >= 0) {
         ctx->images[image_idx].metadata_blob = ctx->blobs[blob_idx];
+        if (ctx->header.boot_index == (uint32_t)(image_idx + 1))
+            reshdr_set(&ctx->header.boot_metadata,
+                       ctx->images[image_idx].metadata_blob.compressed_size,
+                       ctx->images[image_idx].metadata_blob.flags,
+                       ctx->images[image_idx].metadata_blob.offset,
+                       ctx->images[image_idx].metadata_blob.original_size);
     }
 
     return 0;

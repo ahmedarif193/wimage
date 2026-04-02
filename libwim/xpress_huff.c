@@ -196,6 +196,7 @@ static XpressStatus decompress_core(
 }
 
 /* Heap-allocating decompressor (original API) */
+#ifndef XPRESS_HUFF_DECOMPRESS_ONLY
 XpressStatus xpress_huff_decompress(
     const uint8_t* in, uint32_t in_len,
     uint8_t* out, uint32_t out_len)
@@ -209,6 +210,7 @@ XpressStatus xpress_huff_decompress(
     free(tbl);
     return st;
 }
+#endif
 
 /* Static decompressor: no malloc, caller provides workspace.
  * workspace must be at least XPRESS_DECOMPRESS_WORKSPACE_SIZE bytes. */
@@ -231,6 +233,7 @@ XpressStatus xpress_huff_decompress_static(
  *    and inline length-extension bytes
  *======================================================================*/
 
+#ifndef XPRESS_HUFF_DECOMPRESS_ONLY
 /* --- Huffman tree for code-length assignment --- */
 
 typedef struct { uint32_t f; int16_t l, r, sym; } HNode;
@@ -780,3 +783,4 @@ XpressStatus xpress_huff_compress(
     xpress_huff_destroy_scratch(scratch);
     return st;
 }
+#endif
