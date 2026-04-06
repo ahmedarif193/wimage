@@ -1,9 +1,21 @@
 cmake_minimum_required(VERSION 3.14)
-project(wimage C)
+project(wimage
+    VERSION 1.0
+    LANGUAGES C
+    DESCRIPTION "Clean-room Windows Imaging Format (WIM) reader/writer")
 
 set(CMAKE_C_STANDARD 11)
 
 option(ENABLE_TESTS "Build GTest unit tests" OFF)
+
+# Bake project version into a generated header. The major/minor come from
+# project(... VERSION X.Y); each release bumps major by +1.0 (v1.0 -> v2.0
+# -> v3.0 ...), so the number visible in --version and "wimage info" output
+# tracks the release line directly.
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/libwim/wimage_version.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/wimage_version.h
+    @ONLY)
 
 # --- libwim static library ---
 file(GLOB LIBWIM_SRCS libwim/*.c)
@@ -20,7 +32,9 @@ endif()
 
 # --- wimage CLI tool ---
 add_executable(wimage wimage.c)
-target_include_directories(wimage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libwim)
+target_include_directories(wimage PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/libwim
+    ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(wimage PRIVATE wim_static Threads::Threads)
 
 # --- GTest unit tests ---

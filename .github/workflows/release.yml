@@ -21,13 +21,17 @@ jobs:
     - name: Generate version
       id: version
       run: |
-        DATE=$(date -u +%Y%m%d)
-        SHORT=$(git rev-parse --short HEAD)
-        COUNT=$(git rev-list --count HEAD)
-        VERSION="0.2.${COUNT}"
+        # Incremental major bump scheme: v1.0, v2.0, v3.0, ...
+        # The major number is (count of existing vN.0 tags) + 1, so the
+        # first release is v1.0 (not v0.x), and every subsequent release
+        # bumps the major by +1.0 regardless of commit count.
+        EXISTING=$(git tag -l 'v*.0' | grep -E '^v[0-9]+\.0$' | wc -l)
+        MAJOR=$((EXISTING + 1))
+        VERSION="${MAJOR}.0"
         TAG="v${VERSION}"
         echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
         echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+        echo "Next release: ${TAG}"
 
     - name: Install dependencies
       run: sudo apt-get update && sudo apt-get install -y libssl-dev wimtools

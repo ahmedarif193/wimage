@@ -17,6 +17,64 @@
 #include <string.h>
 #include <stdlib.h>
 
+/*
+ * SIMD gating policy
+ * ------------------
+ * SSE2 is part of the x86_64 baseline ABI so the intrinsics are always
+ * safe to compile on any amd64 target. However, by project policy we
+ * only enable the SSE2 hot paths on GenuineIntel silicon — AMD, Via,
+ * Hygon, Zhaoxin and any other vendor fall through to the scalar code.
+ * (The ISA is architecturally identical on AMD; this gate is a project
+ * choice, not a correctness requirement.)
+ *
+ * The gate is runtime: every wimage binary still ships with both code
+ * paths.  CPUID leaf 0 returns the vendor string in EBX/EDX/ECX, and
+ * an ELF constructor sets `wimage_sse2_enabled` once at startup so the
+ * hot loops only pay a predictable branch on a static global.
+ */
+#if defined(__x86_64__) || defined(_M_X64)
+#  include <emmintrin.h>
+#  define WIMAGE_HAVE_SSE2 1
+#  if defined(__GNUC__) || defined(__clang__)
+#    include <cpuid.h>
+#  elif defined(_MSC_VER)
+#    include <intrin.h>
+#  endif
+
+static int wimage_sse2_enabled = 0;
+
+static void wimage_detect_intel(void)
+{
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+#if defined(__GNUC__) || defined(__clang__)
+    if (!__get_cpuid(0u, &eax, &ebx, &ecx, &edx))
+        return;
+#elif defined(_MSC_VER)
+    int regs[4] = {0, 0, 0, 0};
+    __cpuid(regs, 0);
+    eax = (unsigned)regs[0]; ebx = (unsigned)regs[1];
+    ecx = (unsigned)regs[2]; edx = (unsigned)regs[3];
+#else
+    return; /* no portable CPUID available */
+#endif
+    /* "GenuineIntel" = {EBX, EDX, ECX} little-endian ASCII:
+     *   EBX = 'G','e','n','u' = 0x756E6547
+     *   EDX = 'i','n','e','I' = 0x49656E69
+     *   ECX = 'n','t','e','l' = 0x6C65746E
+     */
+    if (ebx == 0x756E6547u && edx == 0x49656E69u && ecx == 0x6C65746Eu)
+        wimage_sse2_enabled = 1;
+}
+
+#  if defined(__GNUC__) || defined(__clang__)
+__attribute__((constructor))
+static void wimage_cpuid_init(void) { wimage_detect_intel(); }
+#  else
+/* MSVC: no attribute((constructor)), call wimage_detect_intel() explicitly
+ * from a one-time init if we ever target that toolchain. Not used today. */
+#  endif
+#endif
+
 /*======================================================================
  * Byte-order helpers
  *======================================================================*/
@@ -184,9 +242,49 @@ static XpressStatus decompress_core(
             }
 
             if (moff > opos) return XPRESS_BAD_DATA;
-            for (uint32_t j = 0; j < mlen && opos < out_len; j++) {
-                out[opos] = out[opos - moff];
-                opos++;
+
+            /* Clamp mlen to remaining output so we only branch-check once. */
+            uint32_t remain = out_len - opos;
+            uint32_t copy_len = mlen < remain ? mlen : remain;
+
+#if WIMAGE_HAVE_SSE2
+            /*
+             * Fast path: moff >= 16 means the match source is at least
+             * one full vector behind the destination, so overlapping
+             * 16-byte loads/stores are safe.  This handles the vast
+             * majority of matches in typical WIM content (PE files,
+             * text, zero-runs with large strides) and brings the decode
+             * throughput close to raw memcpy bandwidth.
+             *
+             * moff < 16 is the overlapping-RLE case (e.g. a byte-wide
+             * repeat) — falling back to the byte loop is correct and
+             * only pays for very short matches anyway.
+             *
+             * Intel-only runtime gate (see top of file).
+             */
+            if (wimage_sse2_enabled && moff >= 16 && copy_len >= 16) {
+                const uint8_t* src = out + opos - moff;
+                uint8_t*       dst = out + opos;
+                uint32_t n = copy_len;
+                while (n >= 16) {
+                    __m128i v = _mm_loadu_si128((const __m128i*)src);
+                    _mm_storeu_si128((__m128i*)dst, v);
+                    src += 16; dst += 16; n -= 16;
+                }
+                uint32_t done = copy_len - n;
+                opos += done;
+                /* Tail (<16 bytes) via the byte loop. */
+                for (uint32_t j = 0; j < n; j++) {
+                    out[opos] = out[opos - moff];
+                    opos++;
+                }
+            } else
+#endif
+            {
+                for (uint32_t j = 0; j < copy_len; j++) {
+                    out[opos] = out[opos - moff];
+                    opos++;
+                }
             }
         }
     }
@@ -427,17 +525,40 @@ static inline uint32_t h3(const uint8_t* p)
     return (((uint32_t)p[0] << 10) ^ ((uint32_t)p[1] << 5) ^ p[2]) & 0x7FFF;
 }
 
-/* Fast match extension using 8-byte word comparisons */
+/* Fast match extension.  On x86_64 we compare 16 bytes at a time with
+ * SSE2 (_mm_cmpeq_epi8 + movemask); elsewhere we fall back to an 8-byte
+ * uint64 compare.  Long matches (common on our ramdisk.img workload,
+ * where runs of zeros extend 30+ KB) benefit most from the wider stride. */
 static inline uint32_t match_len(const uint8_t* a, const uint8_t* b, uint32_t max_len)
 {
     uint32_t len = 0;
+
+#if WIMAGE_HAVE_SSE2
+    /* Intel-only runtime gate (see top of file). */
+    if (wimage_sse2_enabled) {
+        while (len + 16 <= max_len) {
+            __m128i va = _mm_loadu_si128((const __m128i*)(a + len));
+            __m128i vb = _mm_loadu_si128((const __m128i*)(b + len));
+            uint32_t mask = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(va, vb));
+            if (mask != 0xFFFF) {
+                /* Mask has a 1 bit per matching byte (LSB = first byte).
+                 * The first zero bit is the first mismatch position. */
+                len += (uint32_t)__builtin_ctz(~mask & 0xFFFF);
+                return len;
+            }
+            len += 16;
+        }
+    }
+#endif
+
+    /* 8-byte tail (and the entire loop on non-SSE2 hosts) */
     while (len + 8 <= max_len) {
         uint64_t va, vb;
         memcpy(&va, a + len, 8);
         memcpy(&vb, b + len, 8);
         if (va != vb) {
             uint64_t diff = va ^ vb;
-            len += __builtin_ctzll(diff) / 8;
+            len += (uint32_t)(__builtin_ctzll(diff) / 8);
             return len < max_len ? len : max_len;
         }
         len += 8;
