@@ -525,30 +525,6 @@ static void make_codes(const uint8_t cl[NSYM], uint32_t codes[NSYM])
     }
 }
 
-/* --- MSB-first bit array --- */
-
-static void ba_put(uint32_t* a, int pos, uint32_t val, int nb)
-{
-    if (nb <= 0) return;
-    int w = pos / 32, b = pos % 32;
-    int sh = 32 - b - nb;
-    if (sh >= 0) {
-        a[w] |= val << sh;
-    } else {
-        a[w]     |= val >> (-sh);
-        a[w + 1] |= val << (32 + sh);
-    }
-}
-
-static uint16_t ba_get16(const uint32_t* a, int pos)
-{
-    int w = pos / 32, b = pos % 32;
-    if (b <= 16)
-        return (uint16_t)((a[w] >> (16 - b)) & 0xFFFF);
-    else
-        return (uint16_t)(((a[w] << (b - 16)) | (a[w + 1] >> (48 - b))) & 0xFFFF);
-}
-
 /* --- LZ77 token ---
  *
  * `sym` is the Huffman symbol for this token, precomputed during LZ77 so we

@@ -118,7 +118,6 @@ static void compress_one_chunk(ChunkWork* w, XpressCompressScratch* scratch)
     }
 }
 
-#ifndef _WIN32
 typedef struct WimBlobInflight {
     uint8_t  sha1[20];
     int      is_metadata;
@@ -133,13 +132,19 @@ typedef struct WimBlobInflight {
     void     (*free_fn)(void*, size_t);
     void*    free_arg;
 
+#ifndef _WIN32
     atomic_uint_fast64_t chunks_left;
-    uint32_t extra_refs; /* duplicate hits while in flight */
     atomic_int failed;
+#else
+    uint64_t chunks_left;
+    int failed;
+#endif
+    uint32_t extra_refs; /* duplicate hits while in flight */
     struct WimBlobInflight* next;    /* completion list */
     struct WimBlobInflight* ht_next; /* inflight hash chain */
 } WimBlobInflight;
 
+#ifndef _WIN32
 #define WIM_CHUNK_QUEUE_MIN_CAPACITY 32
 #define INFLIGHT_HT_BUCKETS          256u /* must be power of 2 */
 
@@ -415,21 +420,6 @@ static void wim_pool_begin_blob(struct WimThreadPool* pool)
     atomic_fetch_add_explicit(&pool->outstanding, 1, memory_order_release);
 }
 
-static WimBlobInflight* wim_pool_try_pop_completed(struct WimThreadPool* pool)
-{
-    pthread_mutex_lock(&pool->cmtx);
-    WimBlobInflight* b = pool->comp_head;
-    if (b) {
-        pool->comp_head = b->next;
-        if (!pool->comp_head) pool->comp_tail = NULL;
-        pool->comp_count--;
-        atomic_fetch_sub_explicit(&pool->outstanding, 1, memory_order_acq_rel);
-        b->next = NULL;
-    }
-    pthread_mutex_unlock(&pool->cmtx);
-    return b;
-}
-
 static WimBlobInflight* wim_pool_pop_all_completed(struct WimThreadPool* pool,
                                                    uint32_t* count_out)
 {
@@ -517,6 +507,15 @@ static void inflight_ht_remove(struct WimThreadPool* pool, WimBlobInflight* b)
 static int drain_completed_blobs(WimCtx* ctx, int block);
 #endif
 
+static inline int blob_is_failed(const WimBlobInflight* b)
+{
+#ifndef _WIN32
+    return atomic_load_explicit(&b->failed, memory_order_relaxed);
+#else
+    return b->failed;
+#endif
+}
+
 static inline void free_owned_chunk(ChunkWork* w)
 {
     if (w->owns_out && w->out) {
@@ -526,6 +525,7 @@ static inline void free_owned_chunk(ChunkWork* w)
     }
 }
 
+#ifndef _WIN32
 static void inflight_free(WimBlobInflight* b)
 {
     if (!b) return;
@@ -538,13 +538,14 @@ static void inflight_free(WimBlobInflight* b)
         b->free_fn(b->free_arg, (size_t)b->size);
     free(b);
 }
+#endif
 
 static int commit_blob(WimCtx* ctx, WimBlobInflight* b)
 {
     uint64_t blob_offset = (uint64_t)ftello(ctx->file);
     uint64_t written_size = 0;
 
-    if (atomic_load_explicit(&b->failed, memory_order_relaxed))
+    if (blob_is_failed(b))
         return -1;
 
     if (ctx->use_xpress && b->size > 0 && b->num_chunks > 0) {
