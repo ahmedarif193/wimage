@@ -367,9 +367,18 @@ static uint16_t ba_get16(const uint32_t* a, int pos)
         return (uint16_t)(((a[w] << (b - 16)) | (a[w + 1] >> (48 - b))) & 0xFFFF);
 }
 
-/* --- LZ77 token --- */
+/* --- LZ77 token ---
+ *
+ * `sym` is the Huffman symbol for this token, precomputed during LZ77 so we
+ * don't re-derive it in the frequency-count pass or the bitstream emit pass.
+ * Literals use sym = u.lit (0-255); matches use sym = 256 + (ol << 4) + len_hi.
+ * sym >= 256 also serves as the is_match predicate. `ol` is cached for the
+ * same reason — hbit() is a serial log2 loop we'd otherwise call twice per
+ * match. */
 typedef struct {
-    uint16_t is_match;
+    uint16_t sym;
+    uint8_t  ol;         /* offset-log bits (only valid for matches) */
+    uint8_t  _pad;
     union {
         uint8_t lit;
         struct { uint16_t off, len; } m;
@@ -381,18 +390,36 @@ struct XpressCompressScratch {
     uint32_t* ba;
     uint32_t token_cap;
     uint32_t bit_words;
-    int32_t head[32768];
-    int32_t prev[65536];
+    /*
+     * Generation-counter-based hash chain state:
+     *   head_gen[h] == gen means head[h] is valid in the current chunk.
+     *   gen is bumped once per compress call; when it overflows to 0 we
+     *   zero head_gen[] once and restart at 1. This avoids the 128 KB
+     *   head[]/256 KB prev[] memset that previously ran for every chunk.
+     *
+     * prev[] is intentionally NOT zero-initialized: because chunk_size is
+     * constrained to the 65536-entry LZ77 window, prev[p] is always written
+     * by HC_INSERT(p) before anything could possibly read it (the chain
+     * walk starts from head[hv] and only visits positions already inserted
+     * in the current generation).
+     */
+    int32_t  head[32768];
+    int32_t  prev[65536];
+    uint16_t head_gen[32768];
+    uint16_t gen;
 };
 
 static inline int hbit(uint32_t v) { int r = 0; while (v > 1) { v >>= 1; r++; } return r; }
 
-static inline uint16_t tok_to_sym(const Tok* t)
+/* Build the XPRESS-Huffman symbol for a match in one place.
+ * literals use sym = lit (0-255); matches use sym = 256 + (ol << 4) + len_hi. */
+static inline uint16_t match_sym(uint16_t off, uint16_t len, uint8_t* out_ol)
 {
-    if (!t->is_match) return t->u.lit;
-    int ol = hbit(t->u.m.off);
-    uint32_t lh = t->u.m.len - 3;
-    return (uint16_t)(256 + (ol << 4) + (lh > 15 ? 15 : lh));
+    int ol = hbit(off);
+    uint32_t lh = (uint32_t)len - 3u;
+    if (lh > 15) lh = 15;
+    if (out_ol) *out_ol = (uint8_t)ol;
+    return (uint16_t)(256 + (ol << 4) + lh);
 }
 
 static inline uint32_t h3(const uint8_t* p)
@@ -543,15 +570,26 @@ XpressStatus xpress_huff_compress_prechecked_with_scratch(
     Tok* tok = scratch->tok;
     int32_t* head = scratch->head;
     int32_t* prev = scratch->prev;
-    for (int i = 0; i < 32768; i++) head[i] = -1;
-    memset(prev, 0xFF, WSIZE * sizeof(int32_t)); /* -1 */
+    uint16_t* head_gen = scratch->head_gen;
 
-    /* Insert position into hash chain (guard: need 3 bytes for h3) */
+    /* Bump generation counter; on wraparound reset head_gen[] once.
+     * gen 0 is the "never written" sentinel so we start at 1. */
+    scratch->gen++;
+    if (scratch->gen == 0) {
+        memset(head_gen, 0, sizeof(uint16_t) * 32768);
+        scratch->gen = 1;
+    }
+    const uint16_t gen_local = scratch->gen;
+
+    /* Insert position into hash chain (guard: need 3 bytes for h3).
+     * If head_gen[hv] != gen we treat the bucket as empty. */
     #define HC_INSERT(p) do { \
         if ((p) + 2 < in_len) { \
             uint32_t hv_ = h3(in + (p)); \
-            prev[(p) & (WSIZE-1)] = head[hv_]; \
+            int32_t  oldh_ = (head_gen[hv_] == gen_local) ? head[hv_] : -1; \
+            prev[(p) & (WSIZE-1)] = oldh_; \
             head[hv_] = (int32_t)(p); \
+            head_gen[hv_] = gen_local; \
         } \
     } while(0)
 
@@ -560,7 +598,7 @@ XpressStatus xpress_huff_compress_prechecked_with_scratch(
         bl_ = 0; bo_ = 0; \
         if ((p) + 2 < in_len) { \
             uint32_t hv_ = h3(in + (p)); \
-            int32_t cur_ = head[hv_]; \
+            int32_t cur_ = (head_gen[hv_] == gen_local) ? head[hv_] : -1; \
             uint32_t mx_ = in_len - (p); \
             if (mx_ > 65535) mx_ = 65535; \
             for (int chain_ = 0; chain_ < MAX_CHAIN && cur_ >= 0; chain_++) { \
@@ -591,7 +629,9 @@ XpressStatus xpress_huff_compress_prechecked_with_scratch(
                 if (next_bl > bl + 1) {
                     /* Emit literal for current pos, use next match instead */
                     Tok* t = &tok[ntok++];
-                    t->is_match = 0; t->u.lit = in[pos];
+                    t->sym = in[pos];
+                    t->ol  = 0;
+                    t->u.lit = in[pos];
                     HC_INSERT(pos + 1);
                     pos++;
                     bl = next_bl; bo = next_bo;
@@ -599,7 +639,9 @@ XpressStatus xpress_huff_compress_prechecked_with_scratch(
             }
 
             Tok* t = &tok[ntok++];
-            t->is_match = 1; t->u.m.off = (uint16_t)bo; t->u.m.len = (uint16_t)bl;
+            t->sym = match_sym((uint16_t)bo, (uint16_t)bl, &t->ol);
+            t->u.m.off = (uint16_t)bo;
+            t->u.m.len = (uint16_t)bl;
 
             /* Update hash chain for positions within the match (skip middle for long matches) */
             uint32_t update_limit = bl < 32 ? bl : 32;
@@ -609,7 +651,10 @@ XpressStatus xpress_huff_compress_prechecked_with_scratch(
             pos += bl;
         } else {
             Tok* t = &tok[ntok++];
-            t->is_match = 0; t->u.lit = in[pos++];
+            t->sym = in[pos];
+            t->ol  = 0;
+            t->u.lit = in[pos];
+            pos++;
         }
     }
     #undef HC_INSERT
@@ -617,16 +662,10 @@ XpressStatus xpress_huff_compress_prechecked_with_scratch(
     #undef WSIZE
     #undef MAX_CHAIN
 
-    /* === Pass 2: count frequencies (no sb[] allocation - recompute symbols) === */
+    /* === Pass 2: count frequencies using pre-cached sym === */
     uint32_t freq[NSYM] = {0};
-    uint32_t max_bits = 0;
-    for (uint32_t i = 0; i < ntok; i++) {
-        uint16_t s = tok_to_sym(&tok[i]);
-        freq[s]++;
-        max_bits += MAXCL; /* upper bound: code length */
-        if (tok[i].is_match)
-            max_bits += hbit(tok[i].u.m.off); /* offset extra bits */
-    }
+    for (uint32_t i = 0; i < ntok; i++)
+        freq[tok[i].sym]++;
 
     uint8_t cl[NSYM];
     make_lengths(freq, cl);
@@ -644,102 +683,147 @@ XpressStatus xpress_huff_compress_prechecked_with_scratch(
     uint32_t codes[NSYM];
     make_codes(cl, codes);
 
-    /* === Pass 3: MSB-first bit array (no lx[] allocation - emit inline) === */
-    if (!xpress_huff_reserve_bits(scratch, max_bits))
-        return XPRESS_BAD_DATA;
-    uint32_t* ba = scratch->ba;
-    memset(ba, 0, (((size_t)max_bits + 31) / 32 + 2) * sizeof(uint32_t));
-
-    int tbits = 0;
-    for (uint32_t i = 0; i < ntok; i++) {
-        uint16_t s = tok_to_sym(&tok[i]);
-        int clen = cl[s]; if (clen == 0) clen = 1;
-        ba_put(ba, tbits, codes[s], clen);
-        tbits += clen;
-
-        if (tok[i].is_match) {
-            int ol = hbit(tok[i].u.m.off);
-            if (ol > 0) {
-                uint32_t ex = tok[i].u.m.off & ((1u << ol) - 1);
-                ba_put(ba, tbits, ex, ol);
-                tbits += ol;
-            }
-        }
-    }
-
-    /* === Pass 4: simulate decompressor, emit interleaved output === */
+    /*
+     * === Pass 3: fused streaming bit-writer + decoder simulation ===
+     *
+     * Replaces the old two-pass scheme that (a) packed all bits into ba[]
+     * and then (b) walked the token list again simulating the decoder to
+     * emit 16-bit words.  We now do both in one walk with a 64-bit bit
+     * register:
+     *
+     *   - `push_tok`  = next token whose bits haven't been added to bit_buf
+     *   - `sim_tok`   = next token whose consumption we've simulated
+     *   - `bit_buf`   = 0..63 pending bits, MSB-aligned at bit 63
+     *   - `dn`        = simulated decoder nbits (bits the decoder holds)
+     *
+     * When the decoder needs a refill (dn < threshold for the current sim
+     * token), we must emit a 16-bit word.  For that we need bit_buf to hold
+     * ≥16 bits, so we push producer tokens forward until it does.  Bits
+     * consumed by the sim are drained from the stream via EMIT_WORD; the
+     * producer can always stay ahead because every token contributes at
+     * least 1 bit, so the buffer refills on demand.
+     *
+     * Length-extension bytes are emitted directly into the byte stream at
+     * the exact point in the simulation where the decoder would read them
+     * — after the match's offset extras have been consumed, no bit_buf
+     * state in flight.  The important invariant is that we only emit a
+     * len-ext byte when the last word emitted contained the final bit of
+     * the token's offset extras.  The simulation naturally preserves this
+     * because we only enter the `match_tail` block after `ENSURE_DN(16)`
+     * has drained enough words to cover the match's `clen + ol` bits.
+     */
     if (out_capacity < HTBL_BYTES + 4u) {
         return XPRESS_BUFFER_TOO_SMALL;
     }
 
-    /* Write Huffman table */
+    /* Write packed Huffman code-length table */
     for (int i = 0; i < HTBL_BYTES; i++)
         out[i] = (uint8_t)(cl[2 * i] | (cl[2 * i + 1] << 4));
 
     uint8_t* wp = out + HTBL_BYTES;
     uint8_t* we = out + out_capacity;
 
-    int brp = 0;   /* bit-read position in the bit array */
-    int dn = 0;    /* simulated decompressor nbits */
+    uint64_t bit_buf  = 0;   /* pending bits, MSB-aligned */
+    int      buf_nbits = 0;  /* valid bits in bit_buf (0..63) */
+    int      dn = 0;         /* simulated decoder nbits */
+    uint32_t push_tok = 0;   /* next token to push into bit_buf */
 
-    /*
-     * Simulate demand-driven refill matching the decompressor:
-     *   ENSURE_BITS(N): if nbits < N, emit one 16-bit word
-     * The decompressor starts with bits=0, nbits=0 (no initial preload).
-     */
-#define CEMIT(need) do { \
-    if (dn < (need)) { \
+    /* Push one token's worth of bits into bit_buf. No-op if producer
+     * has already consumed all tokens. */
+    #define PUSH_ONE_TOKEN() do { \
+        if (push_tok < ntok) { \
+            const Tok* _t = &tok[push_tok++]; \
+            uint16_t _s = _t->sym; \
+            int _clen = cl[_s]; if (_clen == 0) _clen = 1; \
+            bit_buf |= ((uint64_t)codes[_s] & ((1ULL << _clen) - 1ULL)) \
+                       << (64 - buf_nbits - _clen); \
+            buf_nbits += _clen; \
+            if (_s >= 256) { \
+                int _ol = _t->ol; \
+                if (_ol > 0) { \
+                    uint32_t _ex = _t->u.m.off & ((1u << _ol) - 1u); \
+                    bit_buf |= ((uint64_t)_ex) << (64 - buf_nbits - _ol); \
+                    buf_nbits += _ol; \
+                } \
+            } \
+        } \
+    } while(0)
+
+    /* Emit the top 16 bits of bit_buf as one 16-bit little-endian word.
+     * When buf_nbits < 16 the tail bits are zero (bit_buf is cleared by
+     * the shift), which acts as end-of-stream padding the decoder never
+     * actually decodes (it stops on output count, not stream position). */
+    #define EMIT_WORD() do { \
         if (wp + 2 > we) goto full; \
-        wr16(wp, ba_get16(ba, brp)); \
-        wp += 2; brp += 16; dn += 16; \
-    } \
-} while(0)
+        uint16_t _w = (uint16_t)(bit_buf >> 48); \
+        wr16(wp, _w); wp += 2; \
+        bit_buf <<= 16; \
+        if (buf_nbits >= 16) buf_nbits -= 16; \
+        else                 buf_nbits  = 0; \
+        dn += 16; \
+    } while(0)
 
-    {
-        for (uint32_t i = 0; i < ntok; i++) {
-            uint16_t s = tok_to_sym(&tok[i]);
+    /* Ensure the simulated decoder has at least `need` bits by emitting
+     * words. Producer tokens are pushed opportunistically to keep bit_buf
+     * full, but if we run out of tokens mid-sim we still emit (with zero
+     * padding) because the decoder's refill is unconditional. */
+    #define ENSURE_DN(need) do { \
+        while (dn < (need)) { \
+            while (buf_nbits < 16 && push_tok < ntok) \
+                PUSH_ONE_TOKEN(); \
+            EMIT_WORD(); \
+        } \
+    } while(0)
 
-            /* ENSURE_BITS(MAXCL=15) before Huffman decode */
-            CEMIT(MAXCL);
+    for (uint32_t i = 0; i < ntok; i++) {
+        const Tok* t = &tok[i];
+        uint16_t s = t->sym;
+        int clen = cl[s]; if (clen == 0) clen = 1;
 
-            int clen = cl[s]; if (clen == 0) clen = 1;
-            dn -= clen;
+        /* ENSURE_BITS(MAXCL=15) before huffman decode */
+        ENSURE_DN(MAXCL);
+        dn -= clen;
 
-            if (tok[i].is_match) {
-                int ol = hbit(tok[i].u.m.off);
+        if (s >= 256) {
+            int ol = t->ol;
 
-                /* ENSURE_BITS(16) before offset extra bits */
-                CEMIT(16);
-                dn -= ol;
+            /* ENSURE_BITS(16) before offset extras */
+            ENSURE_DN(16);
+            dn -= ol;
 
-                /* Length extension bytes emitted inline (no lx[] needed) */
-                uint32_t len = tok[i].u.m.len;
-                if (len - 3 >= 15) {
-                    uint32_t el = len - 3 - 15;
-                    if (el < 255) {
-                        if (wp + 1 > we) goto full;
-                        *wp++ = (uint8_t)el;
-                    } else {
-                        /* MS-XCA: uint16 value is (match_length - 3), decompressor adds +3 */
-                        uint32_t raw = len - 3;
-                        if (wp + 3 > we) goto full;
-                        *wp++ = 255;
-                        *wp++ = (uint8_t)(raw & 0xFF);
-                        *wp++ = (uint8_t)((raw >> 8) & 0xFF);
-                    }
+            /* Length extension bytes inlined into the byte stream */
+            uint32_t len = t->u.m.len;
+            if (len - 3 >= 15) {
+                uint32_t el = len - 3 - 15;
+                if (el < 255) {
+                    if (wp + 1 > we) goto full;
+                    *wp++ = (uint8_t)el;
+                } else {
+                    /* MS-XCA: uint16 value is (match_length - 3), decompressor adds +3 */
+                    uint32_t raw = len - 3;
+                    if (wp + 3 > we) goto full;
+                    *wp++ = 255;
+                    *wp++ = (uint8_t)(raw & 0xFF);
+                    *wp++ = (uint8_t)((raw >> 8) & 0xFF);
                 }
             }
         }
-
-        /* Flush remaining bits */
-        while (brp < tbits) {
-            if (wp + 2 > we) goto full;
-            wr16(wp, ba_get16(ba, brp));
-            wp += 2; brp += 16;
-        }
     }
 
-#undef CEMIT
+    /* Drain any bits still sitting in bit_buf that haven't been emitted.
+     * These are the tail bits of the final token(s); the decoder will
+     * consume them either as part of a later ENSURE_BITS refill that
+     * never actually reads the symbols (because the output is full), or
+     * not at all. Either way we write them out as full 16-bit words. */
+    while (push_tok < ntok) {
+        PUSH_ONE_TOKEN();
+        while (buf_nbits >= 16) EMIT_WORD();
+    }
+    while (buf_nbits > 0) EMIT_WORD();
+
+    #undef PUSH_ONE_TOKEN
+    #undef EMIT_WORD
+    #undef ENSURE_DN
 
     {
         uint32_t cs = (uint32_t)(wp - out);

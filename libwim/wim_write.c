@@ -93,36 +93,201 @@ static void compress_one_chunk(ChunkWork* w, XpressCompressScratch* scratch)
 }
 
 #ifndef _WIN32
+/*
+ * Persistent thread pool (F1)
+ * ---------------------------
+ * Created once in wim_create() and torn down by wim_ctx_free().  Workers
+ * block on `work_cv` between blobs, so every write_blob() call pays only
+ * a broadcast+wait round-trip instead of 2N pthread_create/join syscalls.
+ *
+ * Each worker owns its own XpressCompressScratch so there is no contention
+ * on the scratch itself.  A shared fetch-add cursor (`next_idx`) lets
+ * workers dynamically claim chunks — this is better than the old stride-
+ * based split for blobs whose last few chunks compress slower than average
+ * (small tail chunk, highly-compressible regions, etc.).
+ */
+struct WimThreadPool {
+    pthread_t*       threads;
+    int              thread_count;
+
+    pthread_mutex_t  mtx;
+    pthread_cond_t   work_cv;
+    pthread_cond_t   done_cv;
+
+    /* Batch state */
+    ChunkWork*       batch_work;
+    uint64_t         batch_num_chunks;
+    uint32_t         batch_max_chunk;
+    uint64_t         batch_next_idx;
+    int              workers_busy;
+    uint64_t         batch_gen;
+
+    int              shutdown;
+};
+
 typedef struct {
-    ChunkWork* work;
-    uint64_t num_chunks;
-    uint32_t max_chunk_size;
-    int      start_index;
-    int      stride;
-} ChunkWorkerArgs;
+    struct WimThreadPool* pool;
+    int                   id;
+} PoolWorkerArg;
 
-static void compress_chunk_stripe(ChunkWork* work, uint64_t num_chunks,
-                                  uint32_t max_chunk_size,
-                                  int start_index, int stride)
+static void* wim_pool_worker_main(void* arg_ptr)
 {
-    XpressCompressScratch* scratch =
-        xpress_huff_create_scratch(max_chunk_size);
+    PoolWorkerArg* arg = (PoolWorkerArg*)arg_ptr;
+    struct WimThreadPool* pool = arg->pool;
 
-    for (uint64_t i = (uint64_t)start_index; i < num_chunks; i += (uint64_t)stride)
-        compress_one_chunk(&work[i], scratch);
+    /* Each worker owns its own scratch, created lazily on first use and
+     * resized as chunk_size changes between batches (rare, but safe). */
+    XpressCompressScratch* scratch = NULL;
+    uint32_t scratch_max = 0;
 
-    xpress_huff_destroy_scratch(scratch);
-}
+    uint64_t my_gen = 0;
 
-static void* compress_worker(void* arg)
-{
-    const ChunkWorkerArgs* worker = (const ChunkWorkerArgs*)arg;
-    compress_chunk_stripe(worker->work, worker->num_chunks,
-                          worker->max_chunk_size,
-                          worker->start_index, worker->stride);
+    pthread_mutex_lock(&pool->mtx);
+    for (;;) {
+        while (!pool->shutdown && pool->batch_gen == my_gen)
+            pthread_cond_wait(&pool->work_cv, &pool->mtx);
+
+        if (pool->shutdown) {
+            pthread_mutex_unlock(&pool->mtx);
+            break;
+        }
+
+        my_gen = pool->batch_gen;
+        uint32_t cur_max = pool->batch_max_chunk;
+        ChunkWork* work = pool->batch_work;
+        uint64_t num_chunks = pool->batch_num_chunks;
+
+        /* Allocate or grow scratch outside the lock */
+        pthread_mutex_unlock(&pool->mtx);
+
+        if (!scratch || scratch_max < cur_max) {
+            if (scratch) xpress_huff_destroy_scratch(scratch);
+            scratch = xpress_huff_create_scratch(cur_max);
+            scratch_max = cur_max;
+        }
+
+        /* Claim chunks via fetch-add until the batch is drained */
+        for (;;) {
+            pthread_mutex_lock(&pool->mtx);
+            if (pool->batch_next_idx >= num_chunks) {
+                pool->workers_busy--;
+                if (pool->workers_busy == 0)
+                    pthread_cond_signal(&pool->done_cv);
+                /* Stay locked for the outer wait loop */
+                break;
+            }
+            uint64_t idx = pool->batch_next_idx++;
+            pthread_mutex_unlock(&pool->mtx);
+
+            compress_one_chunk(&work[idx], scratch);
+        }
+        /* mtx is locked here */
+    }
+
+    if (scratch) xpress_huff_destroy_scratch(scratch);
+    free(arg);
     return NULL;
 }
-#endif
+
+static struct WimThreadPool* wim_pool_create(int thread_count)
+{
+    if (thread_count <= 1) return NULL;
+
+    struct WimThreadPool* pool = (struct WimThreadPool*)calloc(1, sizeof(*pool));
+    if (!pool) return NULL;
+
+    pool->thread_count = thread_count;
+    pthread_mutex_init(&pool->mtx, NULL);
+    pthread_cond_init(&pool->work_cv, NULL);
+    pthread_cond_init(&pool->done_cv, NULL);
+
+    pool->threads = (pthread_t*)calloc((size_t)thread_count, sizeof(pthread_t));
+    if (!pool->threads) {
+        free(pool);
+        return NULL;
+    }
+
+    int started = 0;
+    for (int i = 0; i < thread_count; i++) {
+        PoolWorkerArg* arg = (PoolWorkerArg*)calloc(1, sizeof(*arg));
+        if (!arg) break;
+        arg->pool = pool;
+        arg->id   = i;
+        if (pthread_create(&pool->threads[i], NULL, wim_pool_worker_main, arg) != 0) {
+            free(arg);
+            break;
+        }
+        started++;
+    }
+
+    if (started == 0) {
+        /* Couldn't spin up any threads; fall back to single-threaded */
+        pthread_cond_destroy(&pool->work_cv);
+        pthread_cond_destroy(&pool->done_cv);
+        pthread_mutex_destroy(&pool->mtx);
+        free(pool->threads);
+        free(pool);
+        return NULL;
+    }
+
+    pool->thread_count = started;
+    return pool;
+}
+
+void wim_pool_destroy(struct WimThreadPool* pool)
+{
+    if (!pool) return;
+
+    pthread_mutex_lock(&pool->mtx);
+    pool->shutdown = 1;
+    pthread_cond_broadcast(&pool->work_cv);
+    pthread_mutex_unlock(&pool->mtx);
+
+    for (int i = 0; i < pool->thread_count; i++)
+        pthread_join(pool->threads[i], NULL);
+
+    pthread_cond_destroy(&pool->work_cv);
+    pthread_cond_destroy(&pool->done_cv);
+    pthread_mutex_destroy(&pool->mtx);
+    free(pool->threads);
+    free(pool);
+}
+
+/* Submit a batch of chunks to the pool, compute sha1 in parallel on the
+ * caller thread, and wait for all workers to complete.  Returns 0 on
+ * success, -1 if any chunk failed. */
+static int wim_pool_run_batch(struct WimThreadPool* pool,
+                              ChunkWork* work,
+                              uint64_t num_chunks,
+                              uint32_t max_chunk,
+                              const uint8_t* data_ptr,
+                              uint64_t size,
+                              uint8_t sha1_out[20])
+{
+    pthread_mutex_lock(&pool->mtx);
+    pool->batch_work       = work;
+    pool->batch_num_chunks = num_chunks;
+    pool->batch_max_chunk  = max_chunk;
+    pool->batch_next_idx   = 0;
+    pool->workers_busy     = pool->thread_count;
+    pool->batch_gen++;
+    pthread_cond_broadcast(&pool->work_cv);
+    pthread_mutex_unlock(&pool->mtx);
+
+    /* Compute SHA-1 on the main thread while workers compress */
+    sha1_hash(data_ptr, size, sha1_out);
+
+    pthread_mutex_lock(&pool->mtx);
+    while (pool->workers_busy > 0)
+        pthread_cond_wait(&pool->done_cv, &pool->mtx);
+    pthread_mutex_unlock(&pool->mtx);
+
+    for (uint64_t i = 0; i < num_chunks; i++)
+        if (work[i].failed)
+            return -1;
+    return 0;
+}
+#endif /* !_WIN32 */
 
 /* ================================================================
  *  Blob writing
@@ -160,46 +325,16 @@ static int write_blob(WimCtx* ctx, const uint8_t* data_ptr, uint64_t size,
             in_offset += this_chunk;
         }
 
-        /* Dispatch compression */
-        int nthreads = ctx->num_threads > 1 ? ctx->num_threads : 1;
+        /* Dispatch compression via the persistent pool if available.
+         * Single-chunk blobs (e.g. files <chunk_size) and contexts
+         * without a pool take the inline single-threaded path. */
 #ifndef _WIN32
-        if (nthreads > 1 && num_chunks > 1) {
-            int thread_count = nthreads;
-            if ((uint64_t)thread_count > num_chunks)
-                thread_count = (int)num_chunks;
-
-            pthread_t* tids =
-                (pthread_t*)malloc((size_t)thread_count * sizeof(pthread_t));
-            ChunkWorkerArgs* args =
-                (ChunkWorkerArgs*)calloc((size_t)thread_count, sizeof(ChunkWorkerArgs));
-            int started = 0;
-
-            if (tids && args) {
-                for (int j = 0; j < thread_count; j++) {
-                    args[j].work = work;
-                    args[j].num_chunks = num_chunks;
-                    args[j].max_chunk_size = chunk_size;
-                    args[j].start_index = j;
-                    args[j].stride = thread_count;
-                    if (pthread_create(&tids[started], NULL, compress_worker, &args[j]) != 0)
-                        break;
-                    started++;
-                }
+        if (ctx->pool && num_chunks > 1) {
+            if (wim_pool_run_batch(ctx->pool, work, num_chunks,
+                                   chunk_size, data_ptr, size, sha1_out) != 0) {
+                goto comp_fail;
             }
-
-            if (started == thread_count) {
-                sha1_hash(data_ptr, size, sha1_out);
-                hash_ready = 1;
-            } else {
-                for (int j = started; j < thread_count; j++)
-                    compress_chunk_stripe(work, num_chunks, chunk_size, j, thread_count);
-            }
-
-            for (int j = 0; j < started; j++)
-                pthread_join(tids[j], NULL);
-
-            free(tids);
-            free(args);
+            hash_ready = 1;
         } else
 #endif
         {
@@ -863,7 +998,10 @@ int wim_create(WimCtx* ctx, const char* filename, int use_xpress)
     if (use_xpress) {
         ctx->header.flags |= WIM_HDR_FLAG_COMPRESSION | WIM_HDR_FLAG_COMPRESS_XPRESS;
     }
-    ctx->header.chunk_size = use_xpress ? 32768 : 0;
+    /* Larger chunks = fewer per-chunk Huffman rebuilds and scratch wipes.
+     * 65536 is the sweet spot: 2x fewer Huffman trees than the WIM default,
+     * still within LZ77 window (65535), same decode workspace. */
+    ctx->header.chunk_size = use_xpress ? 65536 : 0;
 
     /* Generate GUID from /dev/urandom, fallback to rand() */
     {
@@ -886,6 +1024,14 @@ int wim_create(WimCtx* ctx, const char* filename, int use_xpress)
 
     ctx->writing = 1;
     ctx->use_xpress = use_xpress;
+
+    /* Create persistent thread pool for chunk compression (F1).
+     * If pool creation fails we fall back silently to single-threaded:
+     * write_blob() checks ctx->pool and picks the inline path when NULL. */
+#ifndef _WIN32
+    if (use_xpress && num_threads > 1)
+        ctx->pool = wim_pool_create(num_threads);
+#endif
 
     /* Write placeholder header */
     uint8_t placeholder[WIM_HEADER_SIZE];

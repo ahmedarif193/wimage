@@ -7,6 +7,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+
+/* Forward decl; definition lives in wim_write.c (keeps pthread types out
+ * of the public header for Windows/single-threaded builds). */
+struct WimThreadPool;
+
+#ifndef _WIN32
+/* Defined in wim_write.c; called by wim_ctx_free() when the ctx owns
+ * a pool.  Kept as an extern so wim_types.h doesn't need to pull in
+ * pthread definitions. */
+void wim_pool_destroy(struct WimThreadPool* pool);
+#endif
+
 /* SHA-1 key for blob lookup */
 typedef struct {
     uint8_t hash[20];
@@ -101,6 +116,12 @@ typedef struct {
     char*    xml_utf8;
     uint8_t* xml_raw;
     size_t   xml_raw_size;
+
+    /* Persistent thread pool (F1): created once by wim_create() for the
+     * lifetime of the WimCtx, torn down by wim_ctx_free().  Workers block
+     * on a condition variable between blobs so there is no pthread_create/
+     * pthread_join overhead on the per-blob compress path. */
+    struct WimThreadPool* pool;
 } WimCtx;
 
 /* Dynamic array helpers */
@@ -198,6 +219,12 @@ static inline int wim_ctx_find_blob(const WimCtx* ctx, const uint8_t sha1[20]) {
 
 static inline void wim_ctx_free(WimCtx* ctx) {
     if (ctx->file) { fclose(ctx->file); ctx->file = NULL; }
+#ifndef _WIN32
+    if (ctx->pool) {
+        wim_pool_destroy(ctx->pool);
+        ctx->pool = NULL;
+    }
+#endif
     free(ctx->blobs);
     free(ctx->blob_ht.slots);
     if (ctx->images) {
