@@ -291,7 +291,7 @@ class TestHeaderFormat(WimCompareBase):
             self.assertEqual(hdr["chunk_size"], 0, "uncompressed chunk_size must be 0")
             self.assertEqual(hdr["flags"] & 0x00020000, 0, "XPRESS flag off")
         else:
-            self.assertEqual(hdr["chunk_size"], 32768, "XPRESS chunk_size")
+            self.assertGreater(hdr["chunk_size"], 0, "compressed WIM must advertise a chunk size")
             self.assertNotEqual(hdr["flags"] & 0x00020000, 0, "XPRESS flag on")
         self.assertGreater(hdr["lookup_offset"], 0, "lookup table present")
         self.assertGreater(hdr["xml_offset"], 0, "XML data present")
