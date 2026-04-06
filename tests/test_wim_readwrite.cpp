@@ -113,7 +113,57 @@ TEST_F(WimTestFixture, CreateAndReopen)
     wim_ctx_init(&ctx2);
     ASSERT_EQ(0, wim_open(&ctx2, path("test.wim").c_str()));
     EXPECT_EQ(1u, ctx2.image_count);
+    wim_ctx_free(&ctx);
     wim_close(&ctx2);
+}
+
+TEST_F(WimTestFixture, CaptureTreeSyncWriteFailureStopsCleanly)
+{
+    make_source_dir("src");
+    write_file("src/file.txt", "data", 4);
+
+    WimCtx ctx;
+    wim_ctx_init(&ctx);
+    ASSERT_EQ(0, wim_create(&ctx, path("test.wim").c_str(), 0));
+
+    FILE* failing = fopen("/dev/full", "w+b");
+    ASSERT_NE(nullptr, failing);
+    fclose(ctx.file);
+    ctx.file = failing;
+    setvbuf(ctx.file, NULL, _IONBF, 0);
+
+    EXPECT_EQ(-1, wim_capture_tree(&ctx, path("src").c_str(), "Img", NULL));
+    wim_ctx_free(&ctx);
+}
+
+TEST_F(WimTestFixture, CaptureTreeAsyncWriteFailureStopsCleanly)
+{
+    make_source_dir("src");
+    char payload[1024];
+    memset(payload, 'A', sizeof(payload));
+    for (int i = 0; i < 128; i++) {
+        char rel[64];
+        snprintf(rel, sizeof(rel), "src/file_%03d.bin", i);
+        write_file(rel, payload, sizeof(payload));
+    }
+
+    WimCtx ctx;
+    wim_ctx_init(&ctx);
+    ctx.num_threads = 4;
+    ASSERT_EQ(0, wim_create(&ctx, path("test.wim").c_str(), 1));
+
+    FILE* failing = fopen("/dev/full", "w+b");
+    ASSERT_NE(nullptr, failing);
+    fclose(ctx.file);
+    ctx.file = failing;
+    setvbuf(ctx.file, NULL, _IONBF, 0);
+
+    int ret = wim_capture_tree(&ctx, path("src").c_str(), "Img", NULL);
+    if (ret == 0)
+        EXPECT_EQ(-1, wim_finalize(&ctx, 0));
+    else
+        EXPECT_EQ(-1, ret);
+    wim_ctx_free(&ctx);
 }
 
 /* ================================================================

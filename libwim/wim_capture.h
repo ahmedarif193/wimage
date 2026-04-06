@@ -10,8 +10,10 @@
 
 #include "wim_types.h"
 
-/* Callback: write blob data, receive SHA-1. Return 0 on success. */
-typedef int (*wim_blob_writer_fn)(const uint8_t* data, uint64_t size,
+/* Return 0 after taking ownership of data; return -1 to leave ownership
+ * with the caller. */
+typedef int (*wim_blob_writer_fn)(uint8_t* data, uint64_t size,
+                                  void (*free_fn)(void*, size_t), void* free_arg,
                                   uint8_t sha1_out[20], void* user);
 
 /* Capture a directory tree into a WimDentry tree, writing file blobs via callback. */

@@ -17,31 +17,42 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * SIMD gating policy
- * ------------------
- * SSE2 is part of the x86_64 baseline ABI so the intrinsics are always
- * safe to compile on any amd64 target. However, by project policy we
- * only enable the SSE2 hot paths on GenuineIntel silicon — AMD, Via,
- * Hygon, Zhaoxin and any other vendor fall through to the scalar code.
- * (The ISA is architecturally identical on AMD; this gate is a project
- * choice, not a correctness requirement.)
- *
- * The gate is runtime: every wimage binary still ships with both code
- * paths.  CPUID leaf 0 returns the vendor string in EBX/EDX/ECX, and
- * an ELF constructor sets `wimage_sse2_enabled` once at startup so the
- * hot loops only pay a predictable branch on a static global.
- */
-#if defined(__x86_64__) || defined(_M_X64)
+/* Runtime SIMD dispatch on Intel; decompress-only builds stay scalar. */
+#if !defined(XPRESS_HUFF_DECOMPRESS_ONLY) && \
+    (defined(__x86_64__) || defined(_M_X64))
 #  include <emmintrin.h>
-#  define WIMAGE_HAVE_SSE2 1
+#  include <tmmintrin.h>
+#  include <immintrin.h>
+#  define WIMAGE_HAVE_SSE2  1
+#  define WIMAGE_HAVE_SSSE3 1
+#  define WIMAGE_HAVE_AVX2  1
 #  if defined(__GNUC__) || defined(__clang__)
 #    include <cpuid.h>
 #  elif defined(_MSC_VER)
 #    include <intrin.h>
 #  endif
 
-static int wimage_sse2_enabled = 0;
+static int wimage_sse2_enabled  = 0;
+static int wimage_ssse3_enabled = 0;
+static int wimage_avx2_enabled  = 0;
+
+/* PSHUFB masks for small-offset RLE expansion. */
+#  if WIMAGE_HAVE_SSSE3
+static int8_t wimage_rle_pshufb_masks[16][16][16]
+    __attribute__((aligned(16)));
+
+static void wimage_init_rle_masks(void)
+{
+    for (int moff = 1; moff <= 15; ++moff) {
+        for (int phase = 0; phase < moff; ++phase) {
+            for (int i = 0; i < 16; ++i) {
+                wimage_rle_pshufb_masks[moff][phase][i] =
+                    (int8_t)((unsigned)(phase + i) % (unsigned)moff);
+            }
+        }
+    }
+}
+#  endif
 
 static void wimage_detect_intel(void)
 {
@@ -57,22 +68,77 @@ static void wimage_detect_intel(void)
 #else
     return; /* no portable CPUID available */
 #endif
-    /* "GenuineIntel" = {EBX, EDX, ECX} little-endian ASCII:
-     *   EBX = 'G','e','n','u' = 0x756E6547
-     *   EDX = 'i','n','e','I' = 0x49656E69
-     *   ECX = 'n','t','e','l' = 0x6C65746E
-     */
-    if (ebx == 0x756E6547u && edx == 0x49656E69u && ecx == 0x6C65746Eu)
-        wimage_sse2_enabled = 1;
+    if (!(ebx == 0x756E6547u && edx == 0x49656E69u && ecx == 0x6C65746Eu))
+        return;
+
+    wimage_sse2_enabled = 1;
+
+#if defined(__GNUC__) || defined(__clang__)
+    if (__get_cpuid(1u, &eax, &ebx, &ecx, &edx) && (ecx & (1u << 9)))
+        wimage_ssse3_enabled = 1;
+#elif defined(_MSC_VER)
+    {
+        int r[4] = {0};
+        __cpuid(r, 1);
+        if (((unsigned)r[2] & (1u << 9)) != 0)
+            wimage_ssse3_enabled = 1;
+    }
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_cpu_supports("avx2"))
+        wimage_avx2_enabled = 1;
+#endif
+
+#  if WIMAGE_HAVE_SSSE3
+    if (wimage_ssse3_enabled)
+        wimage_init_rle_masks();
+#  endif
 }
 
 #  if defined(__GNUC__) || defined(__clang__)
 __attribute__((constructor))
 static void wimage_cpuid_init(void) { wimage_detect_intel(); }
-#  else
-/* MSVC: no attribute((constructor)), call wimage_detect_intel() explicitly
- * from a one-time init if we ever target that toolchain. Not used today. */
 #  endif
+
+#  if WIMAGE_HAVE_AVX2 && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2"), hot))
+static inline void xpress_decopy_avx2(uint8_t* dst,
+                                      const uint8_t* src,
+                                      uint32_t n)
+{
+    while (n >= 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i*)src);
+        _mm256_storeu_si256((__m256i*)dst, v);
+        src += 32; dst += 32; n -= 32;
+    }
+}
+#  endif
+
+#  if WIMAGE_HAVE_SSSE3 && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("ssse3"), noinline))
+static uint32_t xpress_rle_expand_ssse3(uint8_t* dst,
+                                        const uint8_t* src,
+                                        uint32_t moff,
+                                        uint32_t copy_len)
+{
+    uint8_t pat_bytes[16] = {0};
+    for (uint32_t i = 0; i < moff; ++i)
+        pat_bytes[i] = src[i];
+    __m128i pat = _mm_loadu_si128((const __m128i*)pat_bytes);
+
+    uint32_t done = 0;
+    int phase = 0;
+    while (done + 16 <= copy_len) {
+        __m128i mask =
+            _mm_load_si128((const __m128i*)wimage_rle_pshufb_masks[moff][phase]);
+        _mm_storeu_si128((__m128i*)(dst + done), _mm_shuffle_epi8(pat, mask));
+        done += 16;
+        phase = (int)(((unsigned)phase + 16u) % (unsigned)moff);
+    }
+    return done;
+}
+#  endif /* SSSE3 implementation */
 #endif
 
 /*======================================================================
@@ -248,20 +314,27 @@ static XpressStatus decompress_core(
             uint32_t copy_len = mlen < remain ? mlen : remain;
 
 #if WIMAGE_HAVE_SSE2
-            /*
-             * Fast path: moff >= 16 means the match source is at least
-             * one full vector behind the destination, so overlapping
-             * 16-byte loads/stores are safe.  This handles the vast
-             * majority of matches in typical WIM content (PE files,
-             * text, zero-runs with large strides) and brings the decode
-             * throughput close to raw memcpy bandwidth.
-             *
-             * moff < 16 is the overlapping-RLE case (e.g. a byte-wide
-             * repeat) — falling back to the byte loop is correct and
-             * only pays for very short matches anyway.
-             *
-             * Intel-only runtime gate (see top of file).
-             */
+            /* AVX2 for moff>=32, SSE2 for moff>=16, SSSE3 for moff<16. */
+#  if WIMAGE_HAVE_AVX2 && (defined(__GNUC__) || defined(__clang__))
+            if (wimage_avx2_enabled && moff >= 32 && copy_len >= 32) {
+                xpress_decopy_avx2(out + opos, out + opos - moff,
+                                   copy_len & ~31u);
+                uint32_t done = copy_len & ~31u;
+                opos += done;
+                uint32_t tail = copy_len - done;
+                while (tail >= 16) {
+                    __m128i v = _mm_loadu_si128(
+                        (const __m128i*)(out + opos - moff));
+                    _mm_storeu_si128((__m128i*)(out + opos), v);
+                    opos += 16; tail -= 16;
+                }
+                for (uint32_t j = 0; j < tail; j++) {
+                    out[opos] = out[opos - moff];
+                    opos++;
+                }
+            }
+            else
+#  endif
             if (wimage_sse2_enabled && moff >= 16 && copy_len >= 16) {
                 const uint8_t* src = out + opos - moff;
                 uint8_t*       dst = out + opos;
@@ -273,12 +346,23 @@ static XpressStatus decompress_core(
                 }
                 uint32_t done = copy_len - n;
                 opos += done;
-                /* Tail (<16 bytes) via the byte loop. */
                 for (uint32_t j = 0; j < n; j++) {
                     out[opos] = out[opos - moff];
                     opos++;
                 }
-            } else
+            }
+#  if WIMAGE_HAVE_SSSE3 && (defined(__GNUC__) || defined(__clang__))
+            else if (wimage_ssse3_enabled && moff >= 1 && moff < 16 && copy_len >= 16) {
+                uint32_t done = xpress_rle_expand_ssse3(
+                    out + opos, out + opos - moff, moff, copy_len);
+                opos += done;
+                for (uint32_t j = done; j < copy_len; j++) {
+                    out[opos] = out[opos - moff];
+                    opos++;
+                }
+            }
+#  endif
+            else
 #endif
             {
                 for (uint32_t j = 0; j < copy_len; j++) {
@@ -525,10 +609,7 @@ static inline uint32_t h3(const uint8_t* p)
     return (((uint32_t)p[0] << 10) ^ ((uint32_t)p[1] << 5) ^ p[2]) & 0x7FFF;
 }
 
-/* Fast match extension.  On x86_64 we compare 16 bytes at a time with
- * SSE2 (_mm_cmpeq_epi8 + movemask); elsewhere we fall back to an 8-byte
- * uint64 compare.  Long matches (common on our ramdisk.img workload,
- * where runs of zeros extend 30+ KB) benefit most from the wider stride. */
+/* Fast match extension with SSE2 on Intel x86_64. */
 static inline uint32_t match_len(const uint8_t* a, const uint8_t* b, uint32_t max_len)
 {
     uint32_t len = 0;

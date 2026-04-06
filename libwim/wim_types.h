@@ -96,6 +96,7 @@ typedef struct {
     WimHeader   header;
     int         writing;
     int         use_xpress;
+    int         write_error; /* sticky async write failure after ownership transfer */
     int         num_threads; /* 0 or 1 = single-threaded */
 
     /* Blob table */
@@ -117,10 +118,7 @@ typedef struct {
     uint8_t* xml_raw;
     size_t   xml_raw_size;
 
-    /* Persistent thread pool (F1): created once by wim_create() for the
-     * lifetime of the WimCtx, torn down by wim_ctx_free().  Workers block
-     * on a condition variable between blobs so there is no pthread_create/
-     * pthread_join overhead on the per-blob compress path. */
+    /* Async compression pool and in-flight dedup state. */
     struct WimThreadPool* pool;
 } WimCtx;
 

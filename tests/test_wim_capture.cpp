@@ -27,14 +27,17 @@ struct MockWriter {
     std::vector<std::vector<uint8_t>> blobs;
     int fail_at = -1; /* -1 = never fail */
 
-    static int callback(const uint8_t* data, uint64_t size,
+    static int callback(uint8_t* data, uint64_t size,
+                        void (*free_fn)(void*, size_t), void* free_arg,
                         uint8_t sha1_out[20], void* user)
     {
         MockWriter* self = (MockWriter*)user;
         if (self->fail_at == (int)self->blobs.size())
-            return -1;
+            return -1; /* caller will free */
         self->blobs.push_back(std::vector<uint8_t>(data, data + size));
         sha1_hash(data, (uint32_t)size, sha1_out);
+        if (free_fn)
+            free_fn(free_arg, (size_t)size);
         return 0;
     }
 };

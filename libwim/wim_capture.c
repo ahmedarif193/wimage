@@ -38,6 +38,18 @@ int wim_capture_dir(const char* source_dir, WimDentry* root,
 
 #define MMAP_CAPTURE_THRESHOLD (1u << 20)
 
+/* Buffer deleters for the ownership-transfer callback. */
+static void cap_free_munmap(void* p, size_t sz)
+{
+    munmap(p, sz);
+}
+
+static void cap_free_plain(void* p, size_t sz)
+{
+    (void)sz;
+    free(p);
+}
+
 /* Simple qsort comparator for WimDentry by name */
 static int dentry_name_cmp(const void* a, const void* b)
 {
@@ -69,14 +81,22 @@ static int capture_regular_file(const char* full_path, off_t file_size,
 #ifndef _WIN32
     if ((uint64_t)file_size >= MMAP_CAPTURE_THRESHOLD) {
         void* map = mmap(NULL, (size_t)file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd); /* mmap retains its own reference, safe to close fd now */
         if (map != MAP_FAILED) {
 #ifdef POSIX_MADV_SEQUENTIAL
             (void)posix_madvise(map, (size_t)file_size, POSIX_MADV_SEQUENTIAL);
 #endif
-            ret = writer((const uint8_t*)map, (uint64_t)file_size, dentry->sha1, user);
-            munmap(map, (size_t)file_size);
-            close(fd);
+            ret = writer((uint8_t*)map, (uint64_t)file_size,
+                         cap_free_munmap, map, dentry->sha1, user);
+            if (ret != 0)
+                cap_free_munmap(map, (size_t)file_size);
             return ret;
+        }
+        /* mmap failed; fall back to the read path. */
+        fd = open(full_path, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "Warning: Cannot re-open '%s' after mmap failure\n", full_path);
+            return 0;
         }
     }
 #endif
@@ -103,8 +123,10 @@ static int capture_regular_file(const char* full_path, off_t file_size,
             dentry->file_size = total;
         }
 
-        ret = writer(data, (uint64_t)total, dentry->sha1, user);
-        free(data);
+        ret = writer(data, (uint64_t)total,
+                     cap_free_plain, data, dentry->sha1, user);
+        if (ret != 0)
+            cap_free_plain(data, (size_t)total);
         return ret;
     }
 }
@@ -140,6 +162,7 @@ static int capture_recursive(const char* full_path, const char* name,
                 continue;
 
             WimDentry child;
+            wim_dentry_init(&child);
             size_t path_len = strlen(full_path) + 1 + strlen(ent->d_name) + 1;
             char* child_path = (char*)malloc(path_len);
             if (!child_path) {
@@ -151,6 +174,7 @@ static int capture_recursive(const char* full_path, const char* name,
             int ret = capture_recursive(child_path, ent->d_name, &child, writer, user);
             free(child_path);
             if (ret != 0) {
+                wim_dentry_free(&child);
                 closedir(dir);
                 return ret;
             }
@@ -215,6 +239,7 @@ int wim_capture_dir(const char* source_dir, WimDentry* root,
             continue;
 
         WimDentry child;
+        wim_dentry_init(&child);
         size_t path_len = strlen(source_dir) + 1 + strlen(ent->d_name) + 1;
         char* full_path = (char*)malloc(path_len);
         if (!full_path) {
@@ -226,6 +251,7 @@ int wim_capture_dir(const char* source_dir, WimDentry* root,
         int ret = capture_recursive(full_path, ent->d_name, &child, writer, user);
         free(full_path);
         if (ret != 0) {
+            wim_dentry_free(&child);
             closedir(dir);
             return ret;
         }
